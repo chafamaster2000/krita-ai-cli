@@ -360,6 +360,42 @@ def krita_open_file(path: str) -> str:
     return f"Opened: {result.get('name', 'unknown')} ({result.get('width')}x{result.get('height')})"
 
 
+@mcp.tool()
+def krita_batch(commands: list[dict], review: Optional[str] = None):
+    """
+    Run several commands in ONE round-trip instead of one call each. Use this
+    whenever you'd otherwise chain multiple tool calls — e.g. building a region
+    mask with several fills, or "set prompt + switch workspace + generate".
+
+    The projection refreshes once at the end (not per command), and you can
+    fetch the resulting canvas in the same call via `review`.
+
+    Args:
+        commands: List of {"action": str, "params": {...}} items. `action` is the
+            underlying command name (without the "krita_"/"krita_ai_" prefix),
+            e.g. "fill", "draw_shape", "stroke", "set_color", "ai_set_prompt",
+            "ai_set_workspace", "ai_generate". Example:
+              [{"action": "set_color", "params": {"color": "#ffffff"}},
+               {"action": "fill", "params": {"x": 100, "y": 100, "radius": 80}},
+               {"action": "draw_shape", "params": {"shape": "ellipse", "x": 200, "y": 50, "width": 150, "height": 200}}]
+        review: Optional. "fast" or "full" → also returns the final canvas image
+            inline. Omit to skip the screenshot.
+    """
+    result = send_command("batch", {"commands": commands, "review": review}, timeout=120.0)
+
+    if result.get("error"):
+        return f"Error: {result['error']}"
+
+    summary = _json.dumps(
+        {"count": result.get("count"), "results": result.get("results")},
+        indent=2, default=str,
+    )
+    canvas = result.get("canvas")
+    if review and isinstance(canvas, dict) and canvas.get("data_b64"):
+        return [summary, _decode_image(canvas)]
+    return summary
+
+
 # ----- AI Diffusion (Acly/krita-ai-diffusion) tools -----
 # These talk to the AI Diffusion plugin running in the same Krita process via
 # the kritamcp bridge. Require the plugin to be installed and enabled in Krita.
@@ -386,6 +422,18 @@ def krita_ai_status() -> str:
     current style/strength/seed, queued/executing/finished job counts, current prompt.
     """
     return _fmt(send_command("ai_status"))
+
+
+@mcp.tool()
+def krita_ai_overview() -> str:
+    """
+    Full AI Diffusion state in ONE call: status (connection, workspace, style,
+    strength, seed, queue) plus all regions, control layers, recent jobs, and
+    available styles. Prefer this over chaining ai_status + ai_list_regions +
+    ai_list_controls + ai_list_jobs + ai_list_styles when you need the lay of
+    the land before or after making changes.
+    """
+    return _fmt(send_command("ai_overview"))
 
 
 @mcp.tool()

@@ -1,2 +1,2 @@
-fastmcp
+fastmcp>=2.0
 httpx

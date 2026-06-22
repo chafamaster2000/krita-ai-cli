@@ -261,6 +261,10 @@ class KritaMCPExtension(Extension):
                 return self.cmd_list_brushes(params)
             elif action == "open_file":
                 return self.cmd_open_file(params)
+            elif action == "batch":
+                return self.cmd_batch(params)
+            elif action == "ai_overview":
+                return self.cmd_ai_overview(params)
             elif action == "ai_status":
                 return self.cmd_ai_status(params)
             elif action == "ai_set_prompt":
@@ -800,6 +804,37 @@ class KritaMCPExtension(Extension):
 
         return {"status": "ok", "path": filepath, "name": doc.name(), "width": doc.width(), "height": doc.height()}
 
+    def cmd_batch(self, params):
+        """Run several commands in one round-trip.
+
+        Each item is {"action": ..., "params": {...}} — the same shape a single
+        HTTP command takes. Projection is refreshed ONCE at the end instead of
+        per command. If `review` is set (a mode string like "fast"/"full", or
+        true → "fast"), the final canvas image is grabbed and returned too.
+        """
+        commands = params.get("commands", [])
+        if not isinstance(commands, list):
+            return {"error": "batch 'commands' must be a list"}
+
+        review = params.get("review")
+        results = []
+        self._suppress_refresh = True
+        try:
+            for c in commands:
+                results.append(self.execute_command(c))
+        finally:
+            self._suppress_refresh = False
+
+        doc = self.get_active_document()
+        if doc is not None:
+            doc.refreshProjection()
+
+        out = {"status": "ok", "count": len(results), "results": results}
+        if review:
+            mode = review if isinstance(review, str) else "fast"
+            out["canvas"] = self.cmd_get_canvas({"mode": mode})
+        return out
+
     # ----- AI Diffusion bridge -----
     # Talks to the Acly/krita-ai-diffusion plugin running in the same Krita process.
     # All calls happen on the main thread (driven by the QTimer in createActions),
@@ -829,6 +864,29 @@ class KritaMCPExtension(Extension):
         if model is None:
             raise RuntimeError("No active document — open a document in Krita first")
         return ai, model
+
+    def cmd_ai_overview(self, params):
+        """Consolidated AI Diffusion state in one round-trip: status + regions +
+        controls + recent jobs + styles. Lets the client know exactly where it
+        stands before/after a change without chaining 5 calls."""
+        status = self.cmd_ai_status(params)
+        if status.get("error"):
+            return status
+        if status.get("document") is None:
+            return {"status": "ok", "ai": status}
+        regions = self.cmd_ai_list_regions({})
+        controls = self.cmd_ai_list_controls({})
+        jobs = self.cmd_ai_list_jobs({"limit": int(params.get("jobs_limit", 5))})
+        styles = self.cmd_ai_list_styles({"limit": int(params.get("styles_limit", 30))})
+        return {
+            "status": "ok",
+            "ai": status,
+            "regions": regions.get("regions", []),
+            "root_prompt": regions.get("root", {}),
+            "controls": {"root": controls.get("root", []), "regions": controls.get("regions", [])},
+            "recent_jobs": jobs.get("jobs", []),
+            "styles": styles.get("styles", []),
+        }
 
     def cmd_ai_status(self, params):
         ai = self._ai_get()
