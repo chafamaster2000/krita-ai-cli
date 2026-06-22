@@ -16,6 +16,10 @@ KRITA_URL = os.environ.get("KRITA_URL", "http://localhost:5678")
 
 mcp = FastMCP("krita-mcp")
 
+# Persistent HTTP client — reuses the connection across commands instead of
+# paying a fresh TCP handshake on every call.
+_client = httpx.Client(timeout=30.0)
+
 
 def send_command(action: str, params: dict = None, timeout: float = 30.0) -> dict:
     """Send command to Krita plugin and return result."""
@@ -23,10 +27,10 @@ def send_command(action: str, params: dict = None, timeout: float = 30.0) -> dic
         params = {}
 
     try:
-        response = httpx.post(
+        response = _client.post(
             KRITA_URL,
             json={"action": action, "params": params},
-            timeout=timeout
+            timeout=timeout,
         )
         return response.json()
     except httpx.ConnectError:
@@ -39,7 +43,7 @@ def send_command(action: str, params: dict = None, timeout: float = 30.0) -> dic
 def krita_health() -> str:
     """Check if Krita is running and the MCP plugin is active."""
     try:
-        response = httpx.get(f"{KRITA_URL}/health", timeout=5.0)
+        response = _client.get(f"{KRITA_URL}/health", timeout=5.0)
         data = response.json()
         return f"Krita is running. Plugin: {data.get('plugin', 'unknown')}"
     except:

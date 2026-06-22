@@ -4,7 +4,9 @@ Allows Claude (or any MCP client) to paint by sending commands to this plugin.
 """
 
 from krita import *
-from PyQt5.QtCore import QTimer, QThread, pyqtSignal, QPointF, QRectF, QUuid
+from PyQt5.QtCore import (
+    QTimer, QThread, pyqtSignal, QObject, Qt, QPointF, QRectF, QUuid,
+)
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import QMessageBox
 import json
@@ -18,16 +20,25 @@ SERVER_PORT = 5678
 CANVAS_OUTPUT_DIR = os.path.expanduser("~/krita-mcp-output")
 
 class CommandQueue:
-    """Thread-safe command queue for passing commands from HTTP thread to main thread."""
+    """Thread-safe command queue for passing commands from HTTP thread to main thread.
+
+    Event-driven: each command carries its own threading.Event so the HTTP
+    worker thread blocks on exactly its result and is woken the instant the
+    main thread finishes — no polling, no shared-event races.
+    """
     def __init__(self):
         self.queue = []
         self.results = {}
+        self.events = {}  # command_id -> threading.Event
         self.lock = threading.Lock()
-        self.result_event = threading.Event()
 
     def push(self, command_id, command):
+        """Enqueue a command and return the Event to wait on for its result."""
+        ev = threading.Event()
         with self.lock:
             self.queue.append((command_id, command))
+            self.events[command_id] = ev
+        return ev
 
     def pop(self):
         with self.lock:
@@ -38,29 +49,42 @@ class CommandQueue:
     def set_result(self, command_id, result):
         with self.lock:
             self.results[command_id] = result
-        self.result_event.set()
+            ev = self.events.get(command_id)
+        if ev is not None:
+            ev.set()
 
-    def get_result(self, command_id, timeout=120):
-        """Wait for result with timeout.
+    def get_result(self, command_id, ev, timeout=120):
+        """Block on this command's Event until the main thread sets its result.
 
         The default timeout of 120s is important — canvas export and save
-        operations can take a long time on large canvases. The original 30s
-        default caused frequent timeouts. The MCP server's send_command()
-        timeout must match or exceed this value.
+        operations can take a long time on large canvases. The MCP server's
+        send_command() timeout must match or exceed this value.
         """
-        start = threading.Event()
-        for _ in range(int(timeout * 10)):  # Check every 100ms
-            with self.lock:
-                if command_id in self.results:
-                    result = self.results.pop(command_id)
-                    return result
-            self.result_event.wait(0.1)
-            self.result_event.clear()
-        return {"error": "Timeout waiting for command execution"}
+        signalled = ev.wait(timeout)
+        with self.lock:
+            self.events.pop(command_id, None)
+            result = self.results.pop(command_id, None)
+        if not signalled:
+            return {"error": "Timeout waiting for command execution"}
+        if result is None:
+            return {"error": "Command produced no result"}
+        return result
 
 # Global command queue
 command_queue = CommandQueue()
 command_counter = 0
+
+
+class CommandDispatcher(QObject):
+    """Lives on the main (GUI) thread. The HTTP worker emits `pushed` after
+    enqueuing a command; Qt delivers it as a queued slot call on the main
+    thread, so commands are processed the instant they arrive instead of
+    waiting for the next timer tick."""
+    pushed = pyqtSignal()
+
+
+# Global dispatcher — assigned in createActions on the main thread.
+dispatcher = None
 
 class PaintRequestHandler(BaseHTTPRequestHandler):
     """HTTP request handler for paint commands."""
@@ -110,10 +134,15 @@ class PaintRequestHandler(BaseHTTPRequestHandler):
         # Assign command ID and queue it
         command_counter += 1
         command_id = command_counter
-        command_queue.push(command_id, command)
+        ev = command_queue.push(command_id, command)
 
-        # Wait for result from main thread
-        result = command_queue.get_result(command_id)
+        # Wake the main thread immediately (queued signal) instead of waiting
+        # for the fallback timer tick.
+        if dispatcher is not None:
+            dispatcher.pushed.emit()
+
+        # Block on this command's own event until the main thread sets a result.
+        result = command_queue.get_result(command_id, ev)
 
         if "error" in result:
             self.send_json_response(result, 500)
@@ -147,6 +176,7 @@ class KritaMCPExtension(Extension):
         self.timer = None
         self.current_brush_size = 20
         self.current_opacity = 1.0
+        self._suppress_refresh = False
 
     def setup(self):
         """Called when extension is loaded."""
@@ -163,21 +193,35 @@ class KritaMCPExtension(Extension):
             self.server_thread.start()
             print(f"[KritaMCP] HTTP server started on port {SERVER_PORT}")
 
-        # Start timer to process command queue
+        # Dispatcher: HTTP worker emits `pushed`, Qt delivers it as a queued
+        # slot call on this (main) thread → commands run the instant they land.
+        global dispatcher
+        if dispatcher is None:
+            dispatcher = CommandDispatcher()
+            dispatcher.pushed.connect(self.process_commands, Qt.QueuedConnection)
+
+        # Low-frequency fallback timer in case a signal is ever missed (e.g.
+        # a command queued before the dispatcher was wired up). Not the hot path.
         if self.timer is None:
             self.timer = QTimer()
             self.timer.timeout.connect(self.process_commands)
-            self.timer.start(50)  # Check every 50ms
+            self.timer.start(250)
 
     def process_commands(self):
-        """Process commands from queue in main thread."""
-        item = command_queue.pop()
-        if item is None:
-            return
+        """Drain and execute every queued command on the main thread."""
+        while True:
+            item = command_queue.pop()
+            if item is None:
+                return
+            command_id, command = item
+            result = self.execute_command(command)
+            command_queue.set_result(command_id, result)
 
-        command_id, command = item
-        result = self.execute_command(command)
-        command_queue.set_result(command_id, result)
+    def _maybe_refresh(self, doc):
+        """Refresh the projection unless we're inside a batch (which refreshes
+        once at the end)."""
+        if doc is not None and not self._suppress_refresh:
+            doc.refreshProjection()
 
     def execute_command(self, command):
         """Execute a paint command and return result."""
