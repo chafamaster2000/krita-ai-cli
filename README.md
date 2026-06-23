@@ -180,13 +180,21 @@ If you used a virtualenv, set `command` to that venv's Python so `fastmcp` and
 ### 5. (Optional) Prompt-formatting skills + reminder hook
 
 The prompt-formatting brain (see [below](#prompt-formatting-the-secret-sauce))
-lives as **personal Claude Code skills + a reminder hook**, kept in your own
-`~/.claude/` config — **not** shipped in this repo, because the right
-model→convention knowledge changes as new model families ship and shouldn't be
-frozen into the plugin. Three skills carry the knowledge
-(`krita-ai-prompt-format`, `image-prompt-unknown-entities`,
-`image-prompt-sanity-check`), and a reminder-only `PreToolUse` hook injects the
-active model's family before `set_prompt`/`generate`:
+is shipped in this repo under [`claude/`](claude/) as **Claude Code skills + a
+reminder hook** — the source of truth, kept editable on purpose because the right
+model→convention knowledge changes as new model families ship. To use it, copy
+the contents into your own Claude Code config (`~/.claude/` on macOS/Linux,
+`%USERPROFILE%\.claude\` on Windows):
+
+```bash
+cp -r claude/skills/* ~/.claude/skills/
+cp claude/hooks/krita-prompt-reminder.py ~/.claude/hooks/
+```
+
+Three skills carry the knowledge (`krita-ai-prompt-format`,
+`image-prompt-unknown-entities`, `image-prompt-sanity-check`), and a
+reminder-only `PreToolUse` hook injects the active model's family before
+`set_prompt`/`generate`. Wire the hook in your `settings.json`:
 
 ```json
 "PreToolUse": [
@@ -346,7 +354,8 @@ Two more rules the assistant follows:
   describes what the thing actually looks like instead of inventing a generic
   stand-in.
 
-This lives as three editable Claude Code skills + a reminder hook (see
+This ships in the repo as three editable Claude Code skills + a reminder hook
+under [`claude/`](claude/) (see
 [Setup step 5](#5-optional-prompt-formatting-skills--reminder-hook)). They're the
 source of truth and meant to evolve as model families do — not hardcoded into the
 plugin.
