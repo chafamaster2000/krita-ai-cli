@@ -105,20 +105,18 @@ Add to your MCP client config (e.g., Claude Desktop's `claude_desktop_config.jso
 
 If using a virtual environment, point `command` at the venv's Python.
 
-### 5. (Optional) Install the prompt-formatting skills + hook
+### 5. (Optional) Prompt-formatting skills + hook
 
-The repo ships the prompt-formatting workflow as Claude Code skills and a hook in
-`claude/` (the canonical source — same model as the plugin: copy them out to where
-the tool reads them). To activate them, copy into your Claude Code config dir:
-
-| OS | Config dir |
-|----|------------|
-| macOS / Linux | `~/.claude/` |
-| Windows | `%USERPROFILE%\.claude\` |
-
-Copy `claude/skills/*` → `<config>/skills/` and `claude/hooks/krita-prompt-reminder.py`
-→ `<config>/hooks/`. Then add the hook to your `<config>/settings.json` (merge into
-any existing `"hooks"`):
+The prompt-formatting workflow (see [Prompt Formatting](#prompt-formatting--match-the-model-family))
+is implemented as personal Claude Code skills plus a reminder hook, kept in your
+own Claude Code config (`~/.claude/` on macOS/Linux, `%USERPROFILE%\.claude\` on
+Windows) — it is **not** shipped in this repo. Three skills
+(`krita-ai-prompt-format`, `image-prompt-unknown-entities`,
+`image-prompt-sanity-check`) carry the model→convention knowledge; a
+reminder-only `PreToolUse` hook (`~/.claude/hooks/krita-prompt-reminder.py`)
+calls `ai_status` and injects the active model's family before `set_prompt` /
+`generate`. Example hook wiring in `<config>/settings.json` (merge into any
+existing `"hooks"`):
 
 ```json
 "PreToolUse": [
@@ -273,9 +271,9 @@ A reminder-only `PreToolUse` hook (`krita-prompt-reminder.py`) fires before
 injects the active model's family + convention, so the right format is enforced
 even if the skills aren't loaded. It never blocks.
 
-The canonical source for all of this lives in `claude/` in this repo; see
-[Setup step 5](#5-optional-install-the-prompt-formatting-skills--hook) to deploy
-it to your Claude Code config dir.
+These skills and the hook live in your personal Claude Code config, not in this
+repo; see [Setup step 5](#5-optional-prompt-formatting-skills--hook) for the hook
+wiring.
 
 ## The Export Timeout Fix (from upstream)
 
