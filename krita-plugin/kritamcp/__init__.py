@@ -183,7 +183,10 @@ class PaintRequestHandler(BaseHTTPRequestHandler):
         # Block on this command's own event until the main thread sets a result.
         result = command_queue.get_result(command_id, ev, timeout=wait_timeout)
 
-        if "error" in result:
+        # Use a truthy check, not key-presence: several successful results
+        # carry an "error": None field (e.g. ai_status), which must NOT be
+        # treated as an HTTP 500.
+        if result.get("error"):
             self.send_json_response(result, 500)
         else:
             self.send_json_response(result)
@@ -360,6 +363,11 @@ class KritaMCPExtension(Extension):
         color = QColor(bg_color)
         color.setAlpha(255)
         self._solid_fill_layer(layer, width, height, color)
+
+        # Make the filled layer the active node so subsequent painting tools
+        # (draw_shape/fill/stroke) draw ON it instead of on the default layer
+        # underneath, which would be hidden by this opaque background.
+        doc.setActiveNode(layer)
 
         doc.refreshProjection()
 
@@ -1102,7 +1110,7 @@ class KritaMCPExtension(Extension):
         layers = []
         for l in region.layers:
             try:
-                layers.append({"id": str(l.id), "name": l.name, "type": l.type.name})
+                layers.append({"id": l.id.toString(), "name": l.name, "type": l.type.name})
             except Exception:
                 pass
         return {
@@ -1166,7 +1174,7 @@ class KritaMCPExtension(Extension):
                 "positive": root.positive,
                 "negative": root.negative,
             },
-            "active_layer_id": str(active_layer.id) if active_layer else None,
+            "active_layer_id": active_layer.id.toString() if active_layer else None,
             "regions": regions_out,
         }
 
@@ -1187,7 +1195,7 @@ class KritaMCPExtension(Extension):
             target_region = root._regions[i]
         else:
             for r in root._regions:
-                if any(str(l.id) == layer_id for l in r.layers):
+                if any(l.id == QUuid(layer_id) for l in r.layers):
                     target_region = r
                     break
             if target_region is None:
@@ -1221,7 +1229,7 @@ class KritaMCPExtension(Extension):
         return {
             "index": index,
             "mode": control.mode.name,
-            "layer_id": str(control.layer_id),
+            "layer_id": control.layer_id.toString() if control.layer_id is not None else None,
             "strength": control.strength / control.strength_multiplier,
             "start": control.start,
             "end": control.end,
