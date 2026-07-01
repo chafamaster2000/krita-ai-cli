@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""kri — CLI bridge to the kritamcp plugin running inside Krita.
+
+JSON-over-HTTP to the plugin (default http://localhost:5678). Stdlib only,
+so every invocation starts fast and there is no venv.
+
+Env:
+  KRITA_URL       plugin endpoint (default http://localhost:5678)
+  KRITAMCP_TOKEN  shared token; must match the token set in Krita's env
+  KRI_LOOK_PATH   override the default image path used by `kri look`
+
+Exit codes: 0 ok · 1 plugin/connection error · 2 usage error.
+"""
+import argparse
+import base64
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+KRITA_URL = os.environ.get("KRITA_URL", "http://localhost:5678")
+TOKEN = os.environ.get("KRITAMCP_TOKEN", "")
+
+WORKSPACES = ["generation", "upscaling", "live", "animation", "custom"]
+JOB_STATES = ["all", "queued", "executing", "finished", "cancelled"]
+CONTROL_MODES = [
+    "scribble", "line_art", "soft_edge", "canny_edge", "depth", "normal",
+    "pose", "segmentation", "blur", "stencil",
+    "reference", "style", "composition", "face",
+]
+
+
+def send(action, params=None, timeout=30.0):
+    """POST one command. The timeout also travels in the body so the plugin
+    stops waiting just before we would (same contract server.py used)."""
+    body = json.dumps(
+        {"action": action, "params": params or {}, "timeout": timeout}
+    ).encode()
+    headers = {"Content-Type": "application/json"}
+    if TOKEN:
+        headers["X-Kritamcp-Token"] = TOKEN
+    req = urllib.request.Request(KRITA_URL, data=body, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read().decode())
+        except Exception:
+            return {"error": f"HTTP {e.code} from plugin"}
+    except urllib.error.URLError as e:
+        return {"error": (f"Cannot connect to Krita at {KRITA_URL} — is Krita "
+                          f"running with the kritamcp plugin? ({e.reason})")}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def out(result):
+    """Print result as JSON and exit. Errors go to stderr with exit code 1 so
+    `kri a && kri b` chains stop at the first failure."""
+    text = json.dumps(result, indent=1, default=str)
+    if isinstance(result, dict) and result.get("error"):
+        print(text, file=sys.stderr)
+        sys.exit(1)
+    print(text)
+    sys.exit(0)
+
+
+def clean(**params):
+    """Drop None values so the plugin's own defaults apply."""
+    return {k: v for k, v in params.items() if v is not None}
+
+
+def write_image(payload, path):
+    """Decode a plugin canvas payload (data_b64) to a file; return summary."""
+    raw = base64.b64decode(payload["data_b64"])
+    with open(path, "wb") as f:
+        f.write(raw)
+    return {"path": path, "width": payload.get("width"),
+            "height": payload.get("height"), "format": payload.get("format")}
+
+
+def look_path(payload, override):
+    if override:
+        return override
+    ext = "png" if payload.get("format") == "png" else "jpg"
+    return os.environ.get("KRI_LOOK_PATH") or f"/tmp/kri-canvas.{ext}"
+
+
+def parse_points(tokens):
+    pts = []
+    for t in tokens:
+        try:
+            x, y = t.split(",")
+            pts.append([int(x), int(y)])
+        except ValueError:
+            print(f"kri: invalid point '{t}' (expected X,Y)", file=sys.stderr)
+            sys.exit(2)
+    return pts
+
+
+def read_source(file_arg):
+    if file_arg == "-":
+        return sys.stdin.read()
+    with open(file_arg) as f:
+        return f.read()
+
+
+# ----- handlers -----
+
+def cmd_health(a):
+    headers = {"X-Kritamcp-Token": TOKEN} if TOKEN else {}
+    req = urllib.request.Request(f"{KRITA_URL}/health", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            out(json.loads(r.read().decode()))
+    except Exception as e:
+        out({"error": f"Cannot connect to Krita at {KRITA_URL}: {e}"})
+
+
+def cmd_undo(a):
+    out(send("undo"))
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="kri",
+        description="CLI bridge to Krita (kritamcp plugin). Prints JSON; errors exit 1.",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True, metavar="command")
+
+    sp = sub.add_parser("health", help="check the plugin is up")
+    sp.set_defaults(fn=cmd_health)
+
+    sp = sub.add_parser("undo", help="undo last action")
+    sp.set_defaults(fn=cmd_undo)
+
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()
