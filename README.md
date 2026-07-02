@@ -1,8 +1,9 @@
 # kri — talk to your AI assistant, it drives Krita for you
 
-> A fork of [nanayax3/krita-mcp](https://github.com/nanayax3/krita-mcp) that adds a
-> live bridge to [Acly/krita-ai-diffusion](https://github.com/Acly/krita-ai-diffusion),
-> driven by a zero-dependency CLI (`kri`) instead of an MCP server.
+> Started as a fork of [nanayax3/krita-mcp](https://github.com/nanayax3/krita-mcp);
+> now a standalone project: a live bridge to
+> [Acly/krita-ai-diffusion](https://github.com/Acly/krita-ai-diffusion) driven by a
+> zero-dependency CLI (`kri`) instead of an MCP server.
 > You describe what you want in plain language; an AI assistant with shell access
 > (Claude Code, or any coding agent) sets the prompt, switches style, paints rough
 > region masks, generates, shows you the result, and applies it — **all inside your
