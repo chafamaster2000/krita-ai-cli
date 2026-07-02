@@ -94,13 +94,13 @@ def main():
     parts = []
     if has_set_prompt:
         parts.append(
-            "Antes de escribir este prompt usá: krita-ai-prompt-format (formatear "
-            "según el modelo activo), e image-prompt-unknown-entities (googlear "
+            "Antes de escribir este prompt usá: kri-prompt-format (formatear "
+            "según el modelo activo), e kri-prompt-unknown-entities (googlear "
             "nombres propios no famosos antes de describirlos)."
         )
     if has_generate:
         parts.append(
-            "Antes de generar: corré image-prompt-sanity-check sobre el prompt final "
+            "Antes de generar: corré kri-prompt-sanity-check sobre el prompt final "
             "(coherencia con el modelo activo y con lo que pidió el usuario; restos de "
             "ediciones, contradicciones, score tags si la familia los pide, negativo, "
             "nombres propios resueltos)."

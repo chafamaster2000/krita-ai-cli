@@ -200,8 +200,8 @@ cp -r claude/skills/* ~/.claude/skills/
 cp claude/hooks/krita-prompt-reminder.py ~/.claude/hooks/
 ```
 
-Three skills carry the knowledge (`krita-ai-prompt-format`,
-`image-prompt-unknown-entities`, `image-prompt-sanity-check`), and a
+Three skills carry the knowledge (`kri-prompt-format`,
+`kri-prompt-unknown-entities`, `kri-prompt-sanity-check`), and a
 reminder-only `PreToolUse` hook injects the active model's family before
 `kri ai set-prompt` / `kri ai generate` (it matches on the Bash command text and
 stays silent for anything else). Wire the hook in your `settings.json`:

@@ -1,5 +1,5 @@
 ---
-name: krita-ai-prompt-format
+name: kri-prompt-format
 description: Usar SIEMPRE antes de inyectar o cambiar un prompt en AI Diffusion de Krita vía el CLI kri (kri ai set-prompt), al elegir las palabras del positivo o del negativo para una generación en Krita. Cubre clasificar la familia del modelo del estilo activo (Flux, Flux Kontext, Z-Image, Qwen, SD3, SDXL realista = lenguaje natural; Illustrious, NoobAI, Pony, Animagine, anime SDXL/SD1.5 = tags danbooru) y resolver nombres propios desconocidos (personajes, criaturas, lugares de ficción) por web antes de escribir el prompt.
 metadata:
   type: technique
@@ -16,10 +16,10 @@ metadata:
 
 1. **Leé el estado.** Llamá `kri ai status` (o `kri status`). Mirá `model.architecture` (**dato duro**, el resuelto del checkpoint, ej. `"sdxl"`, `"flux"`, `"zimage"`, `"illu"`, `"qwen"`, `"sd3"`), `model.checkpoint`, y como respaldo el `style` filename. Mirá también `prompt.positive` / `prompt.negative` actuales.
 2. **Clasificá la familia** con la **Tabla A (por architecture)**. Si `model.architecture` es `sdxl`/`sd15`/`auto` o `model.available` es false (versión vieja del plugin), usá la **Tabla B (por nombre)** sobre el checkpoint y el style filename/name en minúsculas. Si nada matchea → **no adivines** (ver "Cuando la familia no es obvia").
-3. **Resolvé nombres propios desconocidos.** Si el prompt menciona un personaje/criatura/lugar de ficción que no es una mega-celebridad real, googlealo primero → **REQUERIDO:** [[image-prompt-unknown-entities]].
+3. **Resolvé nombres propios desconocidos.** Si el prompt menciona un personaje/criatura/lugar de ficción que no es una mega-celebridad real, googlealo primero → **REQUERIDO:** [[kri-prompt-unknown-entities]].
 4. **Reescribí** positivo + negativo en la convención de esa familia.
 5. **Inyectá** con `kri ai set-prompt`. (Si vas a cambiar el estilo, usá `kri ai set-params` y volvé al paso 1: el estilo nuevo puede cambiar la convención.)
-6. **Antes de generar**, pasá el prompt final por [[image-prompt-sanity-check]].
+6. **Antes de generar**, pasá el prompt final por [[kri-prompt-sanity-check]].
 
 ## Tabla A — por `model.architecture` (dato duro, preferí esta)
 
@@ -81,7 +81,7 @@ No inventes la convención. En orden:
 
 ## Nombres propios desconocidos → googlear primero
 
-Si el prompt nombra una entidad propia que no es una mega-celebridad/marca/landmark conocidísimo (Messi, Torre Eiffel), **NO la parafrasees a ciegas** ("Deku Tree" → "un árbol ancestral"): googleala y describí cómo se ve de verdad. El detalle completo (reglas booru vs natural, ejemplo) está en **[[image-prompt-unknown-entities]]** — es el paso 3 del workflow.
+Si el prompt nombra una entidad propia que no es una mega-celebridad/marca/landmark conocidísimo (Messi, Torre Eiffel), **NO la parafrasees a ciegas** ("Deku Tree" → "un árbol ancestral"): googleala y describí cómo se ve de verdad. El detalle completo (reglas booru vs natural, ejemplo) está en **[[kri-prompt-unknown-entities]]** — es el paso 3 del workflow.
 
 ## Negativos por familia
 

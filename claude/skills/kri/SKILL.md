@@ -55,10 +55,10 @@ turno cuando necesitás LEER el resultado para decidir el paso siguiente.
    suelto después: ya tenés el canvas de ese turno.
 
 4. **Prompts**: `kri status` te da `ai.model.architecture` (familia del modelo).
-   Antes de `kri ai set-prompt` aplicá la skill **krita-ai-prompt-format**
+   Antes de `kri ai set-prompt` aplicá la skill **kri-prompt-format**
    (natural language vs tags danbooru según familia); nombres propios no
-   mega-famosos → **image-prompt-unknown-entities**; antes de
-   `kri ai generate` → **image-prompt-sanity-check**.
+   mega-famosos → **kri-prompt-unknown-entities**; antes de
+   `kri ai generate` → **kri-prompt-sanity-check**.
 
 5. **Generar**: `kri ai generate --wait` bloquea hasta que la cola se vacía.
    NO hagas polling manual con `kri ai jobs`.
@@ -100,7 +100,7 @@ kri batch <<'EOF' && kri ai status
 EOF
 ```
 La convención de prompt de la familia NUEVA sale del nombre/filename del
-estilo (Tabla B de krita-ai-prompt-format) — no hace falta un turno aparte
+estilo (Tabla B de kri-prompt-format) — no hace falta un turno aparte
 para re-leer `architecture` antes de escribir el prompt.
 
 Generar (después de configurar):

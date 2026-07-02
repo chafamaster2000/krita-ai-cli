@@ -1,9 +1,9 @@
 ---
-name: image-prompt-unknown-entities
+name: kri-prompt-unknown-entities
 description: Usar al armar un prompt de imagen (Krita AI Diffusion, ComfyUI, etc.) que menciona un nombre propio que NO es una mega-celebridad/marca/landmark mundialmente conocido — personajes, criaturas, objetos, lugares, facciones o ítems de ficción, juegos, anime o nichos (ej. "Deku Tree", "Master Chief", "un Diglett"). Antes de escribir el prompt hay que googlear la entidad y describir cómo se ve de verdad, en vez de parafrasearla a ciegas e inventar algo genérico.
 metadata:
   type: technique
-  reusable: krita-ai-prompt-format, iarte-prompt-*
+  reusable: kri-prompt-format, iarte-prompt-*
 ---
 
 # Resolver nombres propios desconocidos antes de promptear
@@ -60,4 +60,4 @@ Pedido: "haceme un Deku Tree"
 - **Descartar el tag del personaje** en un modelo booru que sí lo conoce → perdés el mejor anclaje.
 - **Googlear de más** una mega-celebridad obvia → innecesario.
 
-> En Krita esto es el paso 3 del workflow de [[krita-ai-prompt-format]]. También aplica a las skills `iarte-prompt-*` (ComfyUI).
+> En Krita esto es el paso 3 del workflow de [[kri-prompt-format]]. También aplica a las skills `iarte-prompt-*` (ComfyUI).
