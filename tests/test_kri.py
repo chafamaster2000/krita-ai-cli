@@ -185,6 +185,37 @@ class KriTest(unittest.TestCase):
                 self.assertEqual(f.read(), b"fakeimagebytes")
         self.assertEqual(self.last_request()["params"]["mode"], "fast")
 
+    def test_status_compacts_styles_to_one_line_each(self):
+        """Los estilos salen como strings 'Nombre — filename' (menos tokens),
+        no como lista de objetos."""
+        FakePlugin.responses["batch"] = {
+            "status": "ok", "count": 2,
+            "results": [
+                {"status": "ok", "document": {"name": "x.kra"}},
+                {"status": "ok", "ai": {"workspace": "generation"},
+                 "styles": [{"filename": "built-in/flux.json", "name": "Flux"},
+                            {"filename": "built-in/qwen.json", "name": "Qwen"}]},
+            ],
+        }
+        r = self.kri("status")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        merged = json.loads(r.stdout)
+        self.assertEqual(merged["styles"],
+                         ["Flux - built-in/flux.json",
+                          "Qwen - built-in/qwen.json"])
+
+    def test_look_max_dim_default_defers_to_plugin(self):
+        """Sin --max-dim no se manda max_dim (manda el default del plugin);
+        con --max-dim viaja explícito."""
+        FakePlugin.responses["get_canvas"] = self._canvas_payload()
+        with tempfile.TemporaryDirectory() as d:
+            r = self.kri("look", "-o", os.path.join(d, "a.jpg"))
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertNotIn("max_dim", self.last_request()["params"])
+            r = self.kri("look", "--max-dim", "256", "-o", os.path.join(d, "b.jpg"))
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(self.last_request()["params"]["max_dim"], 256)
+
     def test_look_default_path_uses_system_tempdir(self):
         """Sin -o ni KRI_LOOK_PATH, el default cae en tempfile.gettempdir()
         (no en /tmp hardcodeado, que no existe en Windows)."""

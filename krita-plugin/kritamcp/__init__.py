@@ -675,7 +675,9 @@ class KritaMCPExtension(Extension):
             img = doc.projection(0, 0, w, h)
             fmt, mime, quality = "PNG", "image/png", -1
         else:
-            max_dim = int(params.get("max_dim", 1024))
+            # 512px: suficiente para juzgar composición/ubicación mientras se
+            # itera, y ~4x menos tokens de visión que 1024 (~262 vs ~1050).
+            max_dim = int(params.get("max_dim", 512))
             if w >= h:
                 tw = min(w, max_dim)
                 th = max(1, round(h * tw / w))

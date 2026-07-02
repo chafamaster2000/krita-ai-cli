@@ -167,6 +167,13 @@ def cmd_status(a):
                      else {"error": doc_res["error"]})
     if not ai_res.get("error"):
         merged.update({k: v for k, v in ai_res.items() if k != "status"})
+        # Estilos compactados a una línea c/u: mismo contenido, ~4x menos
+        # tokens que la lista de objetos (el modelo relee esto en cada status).
+        if isinstance(merged.get("styles"), list):
+            merged["styles"] = [
+                f"{s.get('name')} - {s.get('filename')}"
+                for s in merged["styles"] if isinstance(s, dict)
+            ]
     else:
         merged["ai"] = {"error": ai_res["error"]}
     out(merged)
@@ -456,7 +463,8 @@ def build_parser():
     sp = sub.add_parser("look", help="save canvas image to a file, print its path")
     sp.add_argument("--full", action="store_true",
                     help="full-res PNG (default: fast downscaled JPEG)")
-    sp.add_argument("--max-dim", type=int, default=1024, dest="max_dim")
+    sp.add_argument("--max-dim", type=int, default=None, dest="max_dim",
+                    help="downscale cap in px for fast mode (plugin default 512)")
     sp.add_argument("-o", "--out")
     sp.set_defaults(fn=cmd_look)
 
