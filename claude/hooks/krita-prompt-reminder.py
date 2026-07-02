@@ -39,7 +39,9 @@ ARCH = {
 
 def fetch_status():
     token = os.environ.get("KRITAMCP_TOKEN", "")
-    url = os.environ.get("KRITA_URL", "http://localhost:5678")
+    # 127.0.0.1 literal: en Windows "localhost" resuelve IPv6 primero y el
+    # fallback a IPv4 mete ~2s (mismo fix que cli/kri).
+    url = os.environ.get("KRITA_URL", "http://127.0.0.1:5678")
     headers = {"Content-Type": "application/json"}
     if token:
         headers["X-Kritamcp-Token"] = token
