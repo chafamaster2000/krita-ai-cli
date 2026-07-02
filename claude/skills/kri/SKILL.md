@@ -47,10 +47,12 @@ turno cuando necesitás LEER el resultado para decidir el paso siguiente.
    diagonales. No hay shape que falte que justifique otro camino.
 
 3. **Para mirar el canvas**: `kri look` escribe la imagen en el directorio
-   temporal del sistema e imprime el path → leelo con Read. `--full` (PNG a
-   resolución completa) SOLO para la revisión final, nunca mientras iterás.
-   Si el batch ya llevó `--look fast`, NO hagas un `kri look` suelto después:
-   ya tenés el canvas de ese turno.
+   temporal del sistema e imprime el path → leelo con Read. El modo fast
+   devuelve máx. 512px (~260 tokens de visión): alcanza para juzgar
+   composición y ubicación mientras iterás. `--full` (PNG a resolución
+   completa) SOLO para la revisión final; `--max-dim N` si necesitás un
+   punto medio. Si el batch ya llevó `--look fast`, NO hagas un `kri look`
+   suelto después: ya tenés el canvas de ese turno.
 
 4. **Prompts**: `kri status` te da `ai.model.architecture` (familia del modelo).
    Antes de `kri ai set-prompt` aplicá la skill **krita-ai-prompt-format**
@@ -105,3 +107,19 @@ Generar (después de configurar):
 ```bash
 kri ai generate --wait && kri ai apply && kri look
 ```
+
+## Delegar a subagentes (tareas de dibujo largas)
+
+Si el dibujo pide varias rondas de iteración, no lo hagas en la sesión
+principal: el contexto acumulado (imágenes incluidas) hace cada turno más
+lento y más caro. Patrón:
+
+- **La sesión principal** decide QUÉ dibujar: composición, paleta, coordenadas
+  aproximadas — y lo escribe como spec concreto en el prompt del subagente.
+- **Un subagente de contexto limpio ejecuta** el loop dibujar→mirar→corregir
+  con esta skill. Para loops mecánicos con spec claro alcanza un modelo chico
+  (`model: haiku`); reservá el modelo grande para decisiones de composición.
+- **NUNCA dos subagentes en paralelo contra el mismo Krita**: el plugin opera
+  sobre el documento activo y se pisan. Serial siempre.
+- El subagente devuelve el path del último look como evidencia; la sesión
+  principal lo lee UNA vez en vez de acumular cada iteración intermedia.
