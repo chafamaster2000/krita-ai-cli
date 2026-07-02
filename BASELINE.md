@@ -21,12 +21,21 @@ Prompt a pegar (idéntico en ambas corridas):
 > ambiente cálido" formateado según la convención de la nueva familia de modelo.
 > No generes nada. Al final confirmame qué quedó seteado.
 
-Completar `[ESTILO_B]` con un estilo real instalado (anotarlo acá para reusarlo): ________
+Completar `[ESTILO_B]` con un estilo real instalado (anotarlo acá para reusarlo):
+**Anime (Illustrious) — `built-in/anime-illustrious.json`** (estilo base: Z-Image
+Turbo → cambio de familia zimage/natural-language a Illustrious/danbooru).
 
 | Corrida | Fecha | Turnos | Minutos | Notas |
 |---|---|---|---|---|
-| MCP | | | | |
-| kri | | | | |
+| MCP | 2026-07-01 | 2 | ~0.8 | subagente; ai_overview + batch(set_params+set_prompt) |
+| kri (skill v2) | 2026-07-01 | 3 | ~1.2 | subagente; status + batch + ai status suelto de verificación |
+| kri (skill v3) | 2026-07-01 | 2 | ~0.9 | subagente; status + (batch && ai status) en una invocación — verificación incluida en el turno |
+
+> Iteración skill v3: se agregó la regla "un turno = una invocación de Bash" —
+> encadenar acción+verificación con `&&`, y la convención de prompt de la
+> familia nueva sale del nombre del estilo (no hace falta turno para re-leer
+> `architecture`). Ventaja estructural del CLI que MCP no tiene: encadenar
+> comandos distintos en un solo turno.
 
 ## Test 2 — Dibujar y revisar
 
@@ -69,3 +78,19 @@ Prompt a pegar (idéntico en ambas corridas):
 - Target: **kri ≤ 50% de los turnos de MCP** en cada test.
 - Si queda por encima del 60%, revisar la skill: probablemente no está empujando
   lo suficiente hacia `kri batch` / `kri status` como primer y único paso de orientación.
+
+## Veredicto (2026-07-01)
+
+- **Test 1: MCP 2 vs kri 2 (100%). Test 2: MCP 3 vs kri 2 (67%).** El target
+  ≤50% NO se cumplió en ninguno — pero la premisa del target quedó invalidada:
+  se fijó asumiendo que el lado MCP encadenaba tools sueltas, y en este branch
+  el plugin le da a MCP los mismos agregadores (`krita_batch`,
+  `krita_ai_overview`) que a kri. Ambas interfaces baten en el piso de 2-3
+  turnos; por turnos hay **paridad o mejor para kri**, no un 2x.
+- Las ventajas reales del CLI quedan fuera de la métrica de turnos: sin
+  proceso MCP ni venv fastmcp/httpx, sin ~40 tool schemas cargadas en cada
+  sesión, arranque stdlib instantáneo, y encadenado `&&` (acción+verificación
+  en un turno, imposible en MCP).
+- **Decisión Task 13 (retirar server.py): pendiente del usuario** — el criterio
+  numérico tal como está escrito no se cumplió, pero la medición muestra que
+  kri no es peor en turnos y es estructuralmente más simple.
