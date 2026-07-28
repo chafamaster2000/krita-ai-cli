@@ -460,6 +460,15 @@ class KriTest(unittest.TestCase):
         _, seg = FakeDaemon.requests_log[-1]
         self.assertEqual(seg["combine"], 1)
 
+    def test_select_sam_within(self):
+        self._sam_ready()
+        r = self.kri("select", "sam", "hand", "--within", "280", "0",
+                     "150", "150")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        _, seg = FakeDaemon.requests_log[-1]
+        self.assertEqual(seg["within"], [280, 0, 150, 150])
+        self.assertEqual(seg["text"], "hand")
+
     def test_select_sam_list_does_not_touch_selection(self):
         self._sam_ready(mask=None)
         r = self.kri("select", "sam", "car", "--list")
