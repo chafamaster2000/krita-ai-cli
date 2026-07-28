@@ -945,7 +945,13 @@ class KritaMCPExtension(Extension):
     # AI Diffusion generates only inside the active selection (inpaint), so
     # these are the precision tools for targeted generation and edits.
 
-    SELECT_MODES = ("replace", "add", "subtract", "intersect")
+    # Cada modo mapea a la variante nativa de "Select Opaque".
+    SELECT_OPAQUE_ACTIONS = {
+        "replace": "selectopaque",
+        "add": "selectopaque_add",
+        "subtract": "selectopaque_subtract",
+        "intersect": "selectopaque_intersect",
+    }
 
     def _selection_bounds(self, doc):
         """Bounds of the current selection as a result fragment."""
@@ -955,13 +961,8 @@ class KritaMCPExtension(Extension):
         return {"selection": {"x": sel.x(), "y": sel.y(),
                               "width": sel.width(), "height": sel.height()}}
 
-    def _mask_selection(self, doc, draw_fn):
-        """Build a Selection from an antialiased 8-bit mask painted by draw_fn.
-
-        One canvas-sized Grayscale8 QImage + QPainter (C++ side, no per-pixel
-        Python). Antialiased edges land as partial selection values, matching
-        Krita's own 8-bit selection semantics.
-        """
+    def _mask_image(self, doc, draw_fn):
+        """Canvas-sized Grayscale8 mask painted by draw_fn (antialiased)."""
         w, h = doc.width(), doc.height()
         img = QImage(w, h, QImage.Format_Grayscale8)
         img.fill(0)
@@ -971,38 +972,64 @@ class KritaMCPExtension(Extension):
         painter.setBrush(QBrush(QColor(255, 255, 255)))
         draw_fn(painter)
         painter.end()
-        # QImage scanlines are 32-bit aligned; strip the row padding.
-        bpl = img.bytesPerLine()
-        raw = img.constBits().asstring(bpl * h)
-        data = raw if bpl == w else b"".join(
-            raw[i * bpl:i * bpl + w] for i in range(h))
-        sel = Selection()
-        sel.setPixelData(data, 0, 0, w, h)
-        return sel
+        return img
 
-    def _apply_selection(self, doc, new_sel, mode):
-        """Combine new_sel with the document selection. Returns an error dict
-        or None on success."""
-        if mode not in self.SELECT_MODES:
-            return {"error": f"Unknown mode '{mode}'. Valid: {list(self.SELECT_MODES)}"}
-        current = doc.selection()
-        if current is None and mode in ("subtract", "intersect"):
+    def _select_via_layer(self, doc, gray_img, mode):
+        """Mask -> selection through Krita's own Select Opaque on a temp layer.
+
+        This is the ONLY path that yields visible marching ants: selections
+        built with Selection.setPixelData never get an outline cache, so the
+        canvas draws no dotted line for them. Going through the native action
+        also gives us add/subtract/intersect for free. Returns an error dict
+        or None."""
+        action_name = self.SELECT_OPAQUE_ACTIONS.get(mode)
+        if action_name is None:
+            return {"error": (f"Unknown mode '{mode}'. Valid: "
+                              f"{list(self.SELECT_OPAQUE_ACTIONS)}")}
+        if mode in ("subtract", "intersect") and doc.selection() is None:
             return {"error": f"No existing selection to {mode} from"}
-        if mode == "replace" or current is None:
-            doc.setSelection(new_sel)
-            self._maybe_refresh(doc)
-            return None
-        if mode == "add":
-            current.add(new_sel)
-        elif mode == "subtract":
-            current.subtract(new_sel)
-        else:
-            current.intersect(new_sel)
-        doc.setSelection(current)
-        # Sin refresh, la linea punteada (marching ants) puede no redibujarse
-        # hasta el proximo repaint natural del canvas.
+        w, h = doc.width(), doc.height()
+        bpl = gray_img.bytesPerLine()
+        raw = gray_img.constBits().asstring(bpl * h)
+        tight = raw if bpl == w else b"".join(
+            raw[i * bpl:i * bpl + w] for i in range(h))
+        # Capa temporal cuyo alpha ES la máscara (ARGB gris = alpha directo).
+        argb = bytearray(w * h * 4)
+        argb[0::4] = tight
+        argb[1::4] = tight
+        argb[2::4] = tight
+        argb[3::4] = tight
+        prev = doc.activeNode()
+        tmp = doc.createNode("__kri_select_tmp", "paintlayer")
+        doc.rootNode().addChildNode(tmp, None)
+        try:
+            tmp.setPixelData(bytes(argb), 0, 0, w, h)
+            doc.setActiveNode(tmp)
+            doc.waitForDone()
+            action = Krita.instance().action(action_name)
+            if action is None:
+                return {"error": f"Krita action not found: {action_name}"}
+            action.trigger()
+            QApplication.processEvents()
+            doc.waitForDone()
+        finally:
+            if prev is not None:
+                doc.setActiveNode(prev)
+            tmp.remove()
         self._maybe_refresh(doc)
         return None
+
+    def _rebuild_outline(self, doc):
+        """Re-materialize the current selection through the native path so
+        its outline (marching ants) is regenerated after API-side ops like
+        invert/feather/grow that invalidate it."""
+        sel = doc.selection()
+        if sel is None:
+            return
+        w, h = doc.width(), doc.height()
+        data = bytes(sel.pixelData(0, 0, w, h))
+        img = QImage(data, w, h, w, QImage.Format_Grayscale8).copy()
+        self._select_via_layer(doc, img, "replace")
 
     def cmd_select_shape(self, params):
         """Select a rectangle, ellipse or polygon, combined per `mode`."""
@@ -1037,7 +1064,7 @@ class KritaMCPExtension(Extension):
         else:
             return {"error": f"Unknown shape '{shape}'"}
 
-        err = self._apply_selection(doc, self._mask_selection(doc, draw), mode)
+        err = self._select_via_layer(doc, self._mask_image(doc, draw), mode)
         if err:
             return err
         return {"status": "ok", "shape": shape, "mode": mode,
@@ -1071,6 +1098,7 @@ class KritaMCPExtension(Extension):
             return {"error": "No active selection to invert (use select_all first)"}
         sel.invert()
         doc.setSelection(sel)
+        self._rebuild_outline(doc)
         return {"status": "ok", **self._selection_bounds(doc)}
 
     def cmd_select_modify(self, params):
@@ -1096,6 +1124,7 @@ class KritaMCPExtension(Extension):
         else:
             return {"error": f"Unknown op '{op}'. Valid: feather, grow, shrink, border"}
         doc.setSelection(sel)
+        self._rebuild_outline(doc)
         return {"status": "ok", "op": op, "radius": radius,
                 **self._selection_bounds(doc)}
 
@@ -1131,14 +1160,7 @@ class KritaMCPExtension(Extension):
         if img.width() != w or img.height() != h:
             img = img.scaled(w, h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
         img = img.convertToFormat(QImage.Format_Grayscale8)
-        # QImage scanlines are 32-bit aligned; strip the row padding.
-        bpl = img.bytesPerLine()
-        raw_gray = img.constBits().asstring(bpl * h)
-        data = raw_gray if bpl == w else b"".join(
-            raw_gray[i * bpl:i * bpl + w] for i in range(h))
-        sel = Selection()
-        sel.setPixelData(data, 0, 0, w, h)
-        err = self._apply_selection(doc, sel, mode)
+        err = self._select_via_layer(doc, img, mode)
         if err:
             return err
         return {"status": "ok", "mode": mode, **self._selection_bounds(doc)}
