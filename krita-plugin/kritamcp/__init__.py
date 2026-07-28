@@ -990,6 +990,7 @@ class KritaMCPExtension(Extension):
             return {"error": f"No existing selection to {mode} from"}
         if mode == "replace" or current is None:
             doc.setSelection(new_sel)
+            self._maybe_refresh(doc)
             return None
         if mode == "add":
             current.add(new_sel)
@@ -998,6 +999,9 @@ class KritaMCPExtension(Extension):
         else:
             current.intersect(new_sel)
         doc.setSelection(current)
+        # Sin refresh, la linea punteada (marching ants) puede no redibujarse
+        # hasta el proximo repaint natural del canvas.
+        self._maybe_refresh(doc)
         return None
 
     def cmd_select_shape(self, params):
