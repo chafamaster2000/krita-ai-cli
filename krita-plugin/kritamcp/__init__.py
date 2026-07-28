@@ -284,14 +284,26 @@ class KritaMCPExtension(Extension):
                 pass
 
     def process_commands(self):
-        """Drain and execute every queued command on the main thread."""
-        while True:
-            item = command_queue.pop()
-            if item is None:
-                return
-            command_id, command = item
-            result = self.execute_command(command)
-            command_queue.set_result(command_id, result)
+        """Drain and execute every queued command on the main thread.
+
+        Guarded against re-entrancy: if a command in ejecución procesa eventos
+        Qt (waitForDone, acciones nativas), este slot puede volver a dispararse
+        — ejecutar OTRO comando en ese punto muta el documento en medio del
+        primero y crashea libkis. Los comandos nuevos esperan al drain actual.
+        """
+        if getattr(self, "_processing_commands", False):
+            return
+        self._processing_commands = True
+        try:
+            while True:
+                item = command_queue.pop()
+                if item is None:
+                    return
+                command_id, command = item
+                result = self.execute_command(command)
+                command_queue.set_result(command_id, result)
+        finally:
+            self._processing_commands = False
 
     def _maybe_refresh(self, doc):
         """Refresh the projection unless we're inside a batch (which refreshes
@@ -1010,7 +1022,8 @@ class KritaMCPExtension(Extension):
             if action is None:
                 return {"error": f"Krita action not found: {action_name}"}
             action.trigger()
-            QApplication.processEvents()
+            # NO processEvents acá: reentraría el dispatcher de comandos con
+            # la capa temporal viva (mutación concurrente → crash en libkis).
             doc.waitForDone()
         finally:
             if prev is not None:
