@@ -265,6 +265,8 @@ feather it, generate, apply, deselect.
 | `kri select feather R` | Soften the selection edge by R px (do this before inpainting) |
 | `kri select grow R` / `shrink R` / `border R` | Expand / contract / keep only an R px edge band |
 | `kri select info` | Bounds of the current selection (`null` if none) |
+| `kri select sam "prompt"` | **AI selection**: segment by text concept ("the red car"), clicks (`--point X,Y`, `--neg-point`) and/or `--box X Y W H` via the [krita-autoselect](https://github.com/chafamaster2000/krita-autoselect) SAM 3 daemon. Default selects the union of all matches; `--instance N` picks one, `--list` only inspects (scores + bboxes), same `--mode` combines |
+| `kri select from-mask FILE` | Selection from any grayscale mask image (white = selected), scaled to canvas if needed |
 
 Note: selections clip AI generation and native Krita operations, but **not**
 `kri shape`/`stroke`/`fill`, which write pixel data directly.

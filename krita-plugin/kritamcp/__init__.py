@@ -1102,6 +1102,43 @@ class KritaMCPExtension(Extension):
             return {"error": "No active document"}
         return {"status": "ok", **self._selection_bounds(doc)}
 
+    def cmd_select_from_mask(self, params):
+        """Set the selection from a grayscale mask image (base64 PNG/JPEG).
+
+        White = selected, black = not, greys = partial. This is how external
+        segmenters (krita-autoselect / SAM) hand their result to Krita. The
+        mask is scaled to canvas size if it doesn't match.
+        """
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+        mask_b64 = params.get("mask_b64")
+        if not mask_b64:
+            return {"error": "mask_b64 required"}
+        mode = params.get("mode", "replace")
+        try:
+            raw = base64.b64decode(mask_b64)
+        except Exception as e:
+            return {"error": f"Invalid base64 mask: {e}"}
+        img = QImage()
+        if not img.loadFromData(raw) or img.isNull():
+            return {"error": "Could not decode mask image"}
+        w, h = doc.width(), doc.height()
+        if img.width() != w or img.height() != h:
+            img = img.scaled(w, h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        img = img.convertToFormat(QImage.Format_Grayscale8)
+        # QImage scanlines are 32-bit aligned; strip the row padding.
+        bpl = img.bytesPerLine()
+        raw_gray = img.constBits().asstring(bpl * h)
+        data = raw_gray if bpl == w else b"".join(
+            raw_gray[i * bpl:i * bpl + w] for i in range(h))
+        sel = Selection()
+        sel.setPixelData(data, 0, 0, w, h)
+        err = self._apply_selection(doc, sel, mode)
+        if err:
+            return err
+        return {"status": "ok", "mode": mode, **self._selection_bounds(doc)}
+
     # ----- AI Diffusion bridge -----
     # Talks to the Acly/krita-ai-diffusion plugin running in the same Krita process.
     # All calls happen on the main thread (driven by the QTimer in createActions),

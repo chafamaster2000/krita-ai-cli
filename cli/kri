@@ -25,6 +25,8 @@ import time
 
 KRITA_URL = os.environ.get("KRITA_URL", "http://127.0.0.1:5678")
 TOKEN = os.environ.get("KRITAMCP_TOKEN", "")
+# Daemon de segmentación (repo krita-autoselect) para `kri select sam`.
+AUTOSELECT_URL = os.environ.get("AUTOSELECT_URL", "http://127.0.0.1:5679")
 
 WORKSPACES = ["generation", "upscaling", "live", "animation", "custom"]
 JOB_STATES = ["all", "queued", "executing", "finished", "cancelled"]
@@ -35,20 +37,26 @@ CONTROL_MODES = [
 ]
 
 
-def _endpoint():
-    """host, port, base_path from KRITA_URL (no urllib.parse: too heavy)."""
-    rest = KRITA_URL.split("://", 1)[-1]
+def _endpoint(url):
+    """host, port, base_path from a URL (no urllib.parse: too heavy)."""
+    rest = url.split("://", 1)[-1]
     hostport, _, path = rest.partition("/")
     host, _, port = hostport.partition(":")
     return host, int(port or 80), "/" + path if path else ""
 
 
-def http_request(method, path, body=None, timeout=30.0):
+def http_request(method, path, body=None, timeout=30.0, url=None, hint=None):
     """Minimal HTTP/1.1 over a raw socket. `Connection: close` + read-to-EOF
     keeps it correct against both HTTP/1.0 and 1.1 servers. Returns the
-    parsed JSON body regardless of status code (the plugin puts errors in
-    the body), or an {"error": ...} dict on transport failure."""
-    host, port, base = _endpoint()
+    parsed JSON body regardless of status code (the server puts errors in
+    the body), or an {"error": ...} dict on transport failure.
+
+    `url` defaults to the Krita plugin; `hint` customizes the connection
+    error for other services (e.g. the krita-autoselect daemon)."""
+    if url is None:
+        url = KRITA_URL
+        hint = hint or "is Krita running with the kritamcp plugin?"
+    host, port, base = _endpoint(url)
     lines = [
         f"{method} {(base + path) or '/'} HTTP/1.1",
         f"Host: {host}:{port}",
@@ -70,18 +78,18 @@ def http_request(method, path, body=None, timeout=30.0):
                     break
                 chunks.append(chunk)
     except (ConnectionError, socket.gaierror, socket.timeout, OSError) as e:
-        return {"error": (f"Cannot connect to Krita at {KRITA_URL} — is Krita "
-                          f"running with the kritamcp plugin? ({e})")}
+        suffix = f" — {hint}" if hint else ""
+        return {"error": f"Cannot connect to {url}{suffix} ({e})"}
     response = b"".join(chunks)
     head, _, resp_body = response.partition(b"\r\n\r\n")
     try:
         status = int(head.split(None, 2)[1])
     except (IndexError, ValueError):
-        return {"error": f"Malformed HTTP response from plugin at {KRITA_URL}"}
+        return {"error": f"Malformed HTTP response from {url}"}
     try:
         return json.loads(resp_body.decode())
     except Exception:
-        return {"error": f"HTTP {status} from plugin (non-JSON body)"}
+        return {"error": f"HTTP {status} from {url} (non-JSON body)"}
 
 
 def send(action, params=None, timeout=30.0):
@@ -312,6 +320,65 @@ def cmd_select_modify(a):
 
 def cmd_select_info(a):
     out(send("select_info"))
+
+
+def cmd_select_sam(a):
+    """Canvas → daemon krita-autoselect (SAM 3) → selección en Krita."""
+    if not a.text and not a.point and not a.box:
+        print("kri: provide a prompt: TEXT, --point and/or --box",
+              file=sys.stderr)
+        sys.exit(2)
+    canvas = send("get_canvas", {"mode": "full"}, timeout=120.0)
+    if not isinstance(canvas, dict) or canvas.get("error"):
+        out(canvas)
+
+    points, labels = [], []
+    for token in (a.point or []):
+        points.append(parse_points([token])[0])
+        labels.append(1)
+    for token in (a.neg_point or []):
+        points.append(parse_points([token])[0])
+        labels.append(0)
+
+    payload = clean(
+        image_b64=canvas["data_b64"],
+        text=a.text,
+        points=points or None,
+        point_labels=labels if points else None,
+        box=list(a.box) if a.box else None,
+        threshold=a.threshold,
+        combine="union" if a.instance is None else a.instance,
+        list_only=True if a.list else None,
+    )
+    res = http_request(
+        "POST", "/segment", json.dumps(payload).encode(),
+        timeout=a.timeout, url=AUTOSELECT_URL,
+        hint=("is the krita-autoselect daemon running? "
+              "(python server.py in the krita-autoselect repo)"))
+    if not isinstance(res, dict) or res.get("error") or a.list:
+        out(res)
+    if not res.get("count") or not res.get("mask_b64"):
+        out({"error": "no instances found for that prompt",
+             "instances": res.get("instances", [])})
+
+    applied = send("select_from_mask",
+                   {"mask_b64": res["mask_b64"], "mode": a.mode})
+    if not isinstance(applied, dict) or applied.get("error"):
+        out(applied)
+    out({"status": "ok", "count": res["count"],
+         "instances": res["instances"],
+         "selection": applied.get("selection")})
+
+
+def cmd_select_from_mask(a):
+    import base64
+    try:
+        with open(a.file, "rb") as f:
+            mask_b64 = base64.b64encode(f.read()).decode("ascii")
+    except OSError as e:
+        print(f"kri: cannot read mask file: {e}", file=sys.stderr)
+        sys.exit(2)
+    out(send("select_from_mask", {"mask_b64": mask_b64, "mode": a.mode}))
 
 
 # ----- AI Diffusion -----
@@ -575,6 +642,34 @@ def build_parser():
 
     sp = sel.add_parser("info", help="bounds of the current selection")
     sp.set_defaults(fn=cmd_select_info)
+
+    sp = sel.add_parser(
+        "sam", help="AI selection via SAM 3 (krita-autoselect daemon): "
+                    "text concept, clicks and/or box")
+    sp.add_argument("text", nargs="?", default=None,
+                    help="concept prompt, e.g. 'the red car'")
+    sp.add_argument("--point", action="append", metavar="X,Y",
+                    help="include this click (repeatable)")
+    sp.add_argument("--neg-point", action="append", metavar="X,Y",
+                    dest="neg_point", help="exclude this click (repeatable)")
+    sp.add_argument("--box", nargs=4, type=int, metavar=("X", "Y", "W", "H"))
+    sp.add_argument("--threshold", type=float, default=None,
+                    help="instance score threshold (daemon default 0.5)")
+    sp.add_argument("--instance", type=int, default=None,
+                    help="pick ONE instance by rank (0 = best score); "
+                         "default: union of all matches")
+    sp.add_argument("--list", action="store_true",
+                    help="only print instances (score + bbox), don't select")
+    sp.add_argument("--timeout", type=float, default=120.0,
+                    help="seconds to wait (first call loads the model)")
+    _sel_mode(sp)
+    sp.set_defaults(fn=cmd_select_sam)
+
+    sp = sel.add_parser("from-mask",
+                        help="selection from a grayscale mask image file")
+    sp.add_argument("file")
+    _sel_mode(sp)
+    sp.set_defaults(fn=cmd_select_from_mask)
 
     ai = sub.add_parser("ai", help="AI Diffusion plugin").add_subparsers(
         dest="ai_cmd", required=True, metavar="ai-command")

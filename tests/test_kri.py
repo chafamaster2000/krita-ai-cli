@@ -45,24 +45,54 @@ class FakePlugin(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+class FakeDaemon(BaseHTTPRequestHandler):
+    """Fake krita-autoselect daemon: records /segment requests, answers from
+    FakeDaemon.response."""
+    requests_log = []
+    response = {}
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", 0))
+        FakeDaemon.requests_log.append(
+            (self.path, json.loads(self.rfile.read(n))))
+        r = FakeDaemon.response or {"status": "ok"}
+        body = json.dumps(r).encode()
+        self.send_response(500 if r.get("error") else 200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(body)
+
+
 class KriTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.server = HTTPServer(("localhost", 0), FakePlugin)
         cls.port = cls.server.server_address[1]
         threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.daemon = HTTPServer(("localhost", 0), FakeDaemon)
+        cls.daemon_port = cls.daemon.server_address[1]
+        threading.Thread(target=cls.daemon.serve_forever, daemon=True).start()
 
     @classmethod
     def tearDownClass(cls):
         cls.server.shutdown()
         cls.server.server_close()
+        cls.daemon.shutdown()
+        cls.daemon.server_close()
 
     def setUp(self):
         FakePlugin.requests_log.clear()
         FakePlugin.responses = {}
+        FakeDaemon.requests_log.clear()
+        FakeDaemon.response = {}
 
     def kri(self, *args, stdin=None):
-        env = dict(os.environ, KRITA_URL=f"http://localhost:{self.port}")
+        env = dict(os.environ,
+                   KRITA_URL=f"http://localhost:{self.port}",
+                   AUTOSELECT_URL=f"http://localhost:{self.daemon_port}")
         return subprocess.run(
             [sys.executable, KRI, *args],
             capture_output=True, text=True, env=env, input=stdin, timeout=30,
@@ -374,6 +404,109 @@ class KriTest(unittest.TestCase):
         r = self.kri("select", "info")
         self.assertEqual(r.returncode, 1)
         self.assertIn("No active document", r.stderr)
+
+    # ----- select sam (daemon krita-autoselect) -----
+
+    def _sam_ready(self, mask=b"fakemaskpng", count=1):
+        FakePlugin.responses["get_canvas"] = {
+            "status": "ok", "mode": "full", "format": "png",
+            "data_b64": base64.b64encode(b"fakecanvas").decode(),
+            "width": 800, "height": 600}
+        FakePlugin.responses["select_from_mask"] = {
+            "status": "ok", "mode": "replace",
+            "selection": {"x": 10, "y": 10, "width": 100, "height": 80}}
+        FakeDaemon.response = {
+            "status": "ok", "width": 800, "height": 600, "count": count,
+            "instances": [{"index": 0, "score": 0.97, "box": [10, 10, 110, 90]}],
+        }
+        if mask is not None:
+            FakeDaemon.response["mask_b64"] = base64.b64encode(mask).decode()
+
+    def test_select_sam_full_flow(self):
+        """canvas (plugin) → /segment (daemon) → select_from_mask (plugin)."""
+        self._sam_ready()
+        r = self.kri("select", "sam", "the red car",
+                     "--point", "400,300", "--neg-point", "50,60",
+                     "--threshold", "0.6", "--mode", "add")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # 1) canvas pedido al plugin en full
+        self.assertEqual(FakePlugin.requests_log[0]["action"], "get_canvas")
+        self.assertEqual(FakePlugin.requests_log[0]["params"]["mode"], "full")
+        # 2) daemon recibió imagen + prompts
+        path, seg = FakeDaemon.requests_log[-1]
+        self.assertEqual(path, "/segment")
+        self.assertEqual(seg["text"], "the red car")
+        self.assertEqual(seg["points"], [[400, 300], [50, 60]])
+        self.assertEqual(seg["point_labels"], [1, 0])
+        self.assertEqual(seg["threshold"], 0.6)
+        self.assertEqual(seg["combine"], "union")
+        self.assertEqual(seg["image_b64"],
+                         base64.b64encode(b"fakecanvas").decode())
+        # 3) la máscara volvió al plugin con el mode pedido
+        apply_req = FakePlugin.requests_log[-1]
+        self.assertEqual(apply_req["action"], "select_from_mask")
+        self.assertEqual(apply_req["params"]["mask_b64"],
+                         base64.b64encode(b"fakemaskpng").decode())
+        self.assertEqual(apply_req["params"]["mode"], "add")
+        # 4) el resultado mergea instancias + selección
+        res = json.loads(r.stdout)
+        self.assertEqual(res["count"], 1)
+        self.assertEqual(res["selection"]["width"], 100)
+
+    def test_select_sam_instance_flag(self):
+        self._sam_ready()
+        r = self.kri("select", "sam", "car", "--instance", "1")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        _, seg = FakeDaemon.requests_log[-1]
+        self.assertEqual(seg["combine"], 1)
+
+    def test_select_sam_list_does_not_touch_selection(self):
+        self._sam_ready(mask=None)
+        r = self.kri("select", "sam", "car", "--list")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        _, seg = FakeDaemon.requests_log[-1]
+        self.assertTrue(seg["list_only"])
+        actions = [q["action"] for q in FakePlugin.requests_log]
+        self.assertNotIn("select_from_mask", actions)
+        self.assertIn("instances", json.loads(r.stdout))
+
+    def test_select_sam_zero_matches_exits_1(self):
+        self._sam_ready(mask=None, count=0)
+        FakeDaemon.response["instances"] = []
+        r = self.kri("select", "sam", "unicorn")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("no instances", r.stderr)
+
+    def test_select_sam_requires_some_prompt(self):
+        r = self.kri("select", "sam")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("prompt", r.stderr)
+
+    def test_select_sam_daemon_down_mentions_daemon(self):
+        self._sam_ready()
+        env = dict(os.environ,
+                   KRITA_URL=f"http://localhost:{self.port}",
+                   AUTOSELECT_URL="http://localhost:1")
+        r = subprocess.run([sys.executable, KRI, "select", "sam", "car"],
+                           capture_output=True, text=True, env=env, timeout=30)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("krita-autoselect", r.stderr)
+
+    def test_select_from_mask_file(self):
+        FakePlugin.responses["select_from_mask"] = {
+            "status": "ok", "selection": {"x": 0, "y": 0,
+                                          "width": 10, "height": 10}}
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "mask.png")
+            with open(path, "wb") as f:
+                f.write(b"maskbytes")
+            r = self.kri("select", "from-mask", path, "--mode", "intersect")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        req = self.last_request()
+        self.assertEqual(req["action"], "select_from_mask")
+        self.assertEqual(req["params"]["mask_b64"],
+                         base64.b64encode(b"maskbytes").decode())
+        self.assertEqual(req["params"]["mode"], "intersect")
 
     def test_set_prompt_requires_p_or_n(self):
         r = self.kri("ai", "set-prompt")

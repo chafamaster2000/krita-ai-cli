@@ -87,6 +87,17 @@ sin tocar el resto (inpaint). Subcomandos: `rect X Y W H`,
 `--mode replace|add|subtract|intersect`), `all`, `none`, `invert`,
 `feather R`, `grow R`, `shrink R`, `border R`, `info`.
 
+- **`kri select sam "concepto"`** = selección por segmentación (SAM 3, daemon
+  krita-autoselect en `127.0.0.1:5679`). Acepta texto ("the red car"),
+  clicks (`--point X,Y`, `--neg-point X,Y`) y/o `--box X Y W H`, combinables.
+  Default: unión de todas las instancias; `--instance N` elige una (0 = mejor
+  score); `--list` solo inspecciona (scores + bboxes) sin tocar la selección.
+  Preferila sobre rect/ellipse cuando el objetivo es UN OBJETO de la imagen
+  ("seleccioná el auto") y no una zona geométrica. Primera llamada tarda
+  ~10-30s (carga el modelo); si falla con "Cannot connect", el daemon no está
+  corriendo — decírselo al usuario, no reintentar.
+- `kri select from-mask archivo.png` = selección desde cualquier máscara en
+  escala de grises (blanco = seleccionado).
 - Feather antes de generar (10-20px) para que el parche se funda con el
   entorno; al terminar, `kri select none` para no dejar una selección
   colgada que recorte la próxima generación.
