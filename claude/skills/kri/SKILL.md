@@ -35,6 +35,8 @@ turno cuando necesitás LEER el resultado para decidir el paso siguiente.
 
    Las actions son los nombres internos del plugin: `new_canvas`, `set_color`,
    `set_brush`, `stroke`, `fill`, `draw_shape`, `clear`, `undo`, `redo`,
+   `select_shape`, `select_all`, `select_none`, `select_invert`,
+   `select_modify`, `select_info`,
    `ai_set_prompt`, `ai_set_params`, `ai_set_workspace`, `ai_generate`,
    `ai_create_region`, `ai_select_region`, `ai_add_control`.
    El batch PARA en el primer error (exit 1 con `stopped_at`).
@@ -75,6 +77,27 @@ turno cuando necesitás LEER el resultado para decidir el paso siguiente.
    asigná `result = <algo JSON-serializable>` para devolver datos.
    Scripts CORTOS: corre en el main thread de Krita — bloquea la UI y un
    script colgado NO se puede abortar.
+
+## Selecciones (inpaint dirigido)
+
+`kri select` maneja la selección del documento. AI Diffusion genera SOLO
+dentro de la selección activa → es LA herramienta para regenerar una zona
+sin tocar el resto (inpaint). Subcomandos: `rect X Y W H`,
+`ellipse X Y W H`, `poly X,Y X,Y X,Y ...` (los tres aceptan
+`--mode replace|add|subtract|intersect`), `all`, `none`, `invert`,
+`feather R`, `grow R`, `shrink R`, `border R`, `info`.
+
+- Feather antes de generar (10-20px) para que el parche se funda con el
+  entorno; al terminar, `kri select none` para no dejar una selección
+  colgada que recorte la próxima generación.
+- OJO: la selección NO recorta `draw_shape`/`stroke`/`fill` (escriben pixel
+  data directo). Afecta a AI generate y a las operaciones nativas de Krita.
+
+Inpaint canónico (tras configurar el prompt para la zona):
+```bash
+kri select ellipse 300 200 220 180 && kri select feather 15 \
+  && kri ai generate --wait && kri ai apply && kri select none && kri look
+```
 
 ## Flujos canónicos
 

@@ -271,6 +271,49 @@ def cmd_exec(a):
     out(send("exec", {"code": code}, timeout=a.timeout))
 
 
+# ----- Selecciones -----
+
+def cmd_select_rect(a):
+    out(send("select_shape", {"shape": "rectangle", "x": a.x, "y": a.y,
+                              "width": a.width, "height": a.height,
+                              "mode": a.mode}))
+
+
+def cmd_select_ellipse(a):
+    out(send("select_shape", {"shape": "ellipse", "x": a.x, "y": a.y,
+                              "width": a.width, "height": a.height,
+                              "mode": a.mode}))
+
+
+def cmd_select_poly(a):
+    points = parse_points(a.points)
+    if len(points) < 3:
+        print("kri: polygon needs at least 3 points", file=sys.stderr)
+        sys.exit(2)
+    out(send("select_shape", {"shape": "polygon", "points": points,
+                              "mode": a.mode}))
+
+
+def cmd_select_all(a):
+    out(send("select_all"))
+
+
+def cmd_select_none(a):
+    out(send("select_none"))
+
+
+def cmd_select_invert(a):
+    out(send("select_invert"))
+
+
+def cmd_select_modify(a):
+    out(send("select_modify", {"op": a.op, "radius": a.radius}))
+
+
+def cmd_select_info(a):
+    out(send("select_info"))
+
+
 # ----- AI Diffusion -----
 
 def cmd_ai_status(a):
@@ -482,6 +525,56 @@ def build_parser():
                     help="script path, or '-' for stdin (default)")
     sp.add_argument("--timeout", type=float, default=30.0)
     sp.set_defaults(fn=cmd_exec)
+
+    sel = sub.add_parser(
+        "select", help="canvas selections (AI generate inpaints inside them)"
+    ).add_subparsers(dest="select_cmd", required=True, metavar="select-command")
+
+    def _sel_mode(sp):
+        sp.add_argument("--mode", default="replace",
+                        choices=["replace", "add", "subtract", "intersect"],
+                        help="combine with the existing selection")
+
+    sp = sel.add_parser("rect", help="rectangular selection: kri select rect X Y W H")
+    sp.add_argument("x", type=int)
+    sp.add_argument("y", type=int)
+    sp.add_argument("width", type=int)
+    sp.add_argument("height", type=int)
+    _sel_mode(sp)
+    sp.set_defaults(fn=cmd_select_rect)
+
+    sp = sel.add_parser("ellipse", help="elliptical selection in bounding box X Y W H")
+    sp.add_argument("x", type=int)
+    sp.add_argument("y", type=int)
+    sp.add_argument("width", type=int)
+    sp.add_argument("height", type=int)
+    _sel_mode(sp)
+    sp.set_defaults(fn=cmd_select_ellipse)
+
+    sp = sel.add_parser("poly", help="polygon selection: kri select poly X,Y X,Y X,Y ...")
+    sp.add_argument("points", nargs="+", metavar="X,Y")
+    _sel_mode(sp)
+    sp.set_defaults(fn=cmd_select_poly)
+
+    sp = sel.add_parser("all", help="select the whole canvas")
+    sp.set_defaults(fn=cmd_select_all)
+
+    sp = sel.add_parser("none", help="deselect (clear the selection)")
+    sp.set_defaults(fn=cmd_select_none)
+
+    sp = sel.add_parser("invert", help="invert the current selection")
+    sp.set_defaults(fn=cmd_select_invert)
+
+    for op, hlp in [("feather", "soften the selection edge by RADIUS px"),
+                    ("grow", "expand the selection by RADIUS px"),
+                    ("shrink", "contract the selection by RADIUS px"),
+                    ("border", "keep only a RADIUS px band along the edge")]:
+        sp = sel.add_parser(op, help=hlp)
+        sp.add_argument("radius", type=int)
+        sp.set_defaults(fn=cmd_select_modify, op=op)
+
+    sp = sel.add_parser("info", help="bounds of the current selection")
+    sp.set_defaults(fn=cmd_select_info)
 
     ai = sub.add_parser("ai", help="AI Diffusion plugin").add_subparsers(
         dest="ai_cmd", required=True, metavar="ai-command")

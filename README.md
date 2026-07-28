@@ -249,6 +249,26 @@ first failure.
 | `kri batch` | **Run many actions in ONE round-trip** (JSON via stdin or file), stopping at the first error; `--look fast` also returns the final canvas. Use whenever you'd otherwise chain calls (e.g. several fills to build a mask) |
 | `kri exec` | Arbitrary Python inside Krita (requires `KRITAMCP_ALLOW_EXEC=1` at Krita launch) |
 
+### Selections
+
+AI Diffusion generates **only inside the active selection** (inpaint), so
+these are the precision tools for targeted generation: select the zone,
+feather it, generate, apply, deselect.
+
+| Command | What it does |
+|------|--------------|
+| `kri select rect X Y W H` | Rectangular selection; `--mode replace/add/subtract/intersect` combines with the existing one |
+| `kri select ellipse X Y W H` | Elliptical selection in the bounding box (antialiased edge), same `--mode` |
+| `kri select poly X,Y X,Y X,Y ...` | Polygon selection through 3+ points, same `--mode` |
+| `kri select all` / `kri select none` | Select the whole canvas / deselect |
+| `kri select invert` | Invert the current selection |
+| `kri select feather R` | Soften the selection edge by R px (do this before inpainting) |
+| `kri select grow R` / `shrink R` / `border R` | Expand / contract / keep only an R px edge band |
+| `kri select info` | Bounds of the current selection (`null` if none) |
+
+Note: selections clip AI generation and native Krita operations, but **not**
+`kri shape`/`stroke`/`fill`, which write pixel data directly.
+
 ### AI Diffusion bridge
 
 | Command | What it does |

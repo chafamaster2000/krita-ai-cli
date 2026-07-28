@@ -323,6 +323,58 @@ class KriTest(unittest.TestCase):
                 self.assertEqual(req["action"], action)
                 self.assertEqual(req["params"], params)
 
+    # ----- Selecciones -----
+
+    def test_select_command_mappings(self):
+        cases = [
+            (["select", "rect", "10", "20", "100", "50"],
+             "select_shape", {"shape": "rectangle", "x": 10, "y": 20,
+                              "width": 100, "height": 50, "mode": "replace"}),
+            (["select", "ellipse", "0", "0", "300", "200", "--mode", "add"],
+             "select_shape", {"shape": "ellipse", "x": 0, "y": 0,
+                              "width": 300, "height": 200, "mode": "add"}),
+            (["select", "poly", "10,10", "200,10", "100,150", "--mode", "subtract"],
+             "select_shape", {"shape": "polygon",
+                              "points": [[10, 10], [200, 10], [100, 150]],
+                              "mode": "subtract"}),
+            (["select", "all"], "select_all", {}),
+            (["select", "none"], "select_none", {}),
+            (["select", "invert"], "select_invert", {}),
+            (["select", "feather", "12"],
+             "select_modify", {"op": "feather", "radius": 12}),
+            (["select", "grow", "5"],
+             "select_modify", {"op": "grow", "radius": 5}),
+            (["select", "shrink", "3"],
+             "select_modify", {"op": "shrink", "radius": 3}),
+            (["select", "border", "2"],
+             "select_modify", {"op": "border", "radius": 2}),
+            (["select", "info"], "select_info", {}),
+        ]
+        for argv, action, params in cases:
+            with self.subTest(argv=argv):
+                FakePlugin.requests_log.clear()
+                r = self.kri(*argv)
+                self.assertEqual(r.returncode, 0, f"{argv}: {r.stderr}")
+                req = self.last_request()
+                self.assertEqual(req["action"], action)
+                self.assertEqual(req["params"], params)
+
+    def test_select_poly_rejects_bad_point(self):
+        r = self.kri("select", "poly", "10,10", "banana")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("invalid point", r.stderr)
+
+    def test_select_poly_needs_three_points(self):
+        r = self.kri("select", "poly", "10,10", "20,20")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("at least 3 points", r.stderr)
+
+    def test_select_info_error_exits_1(self):
+        FakePlugin.responses["select_info"] = {"error": "No active document"}
+        r = self.kri("select", "info")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("No active document", r.stderr)
+
     def test_set_prompt_requires_p_or_n(self):
         r = self.kri("ai", "set-prompt")
         self.assertEqual(r.returncode, 2)

@@ -941,6 +941,167 @@ class KritaMCPExtension(Extension):
             out["canvas"] = self.cmd_get_canvas({"mode": mode})
         return out
 
+    # ----- Selections -----
+    # AI Diffusion generates only inside the active selection (inpaint), so
+    # these are the precision tools for targeted generation and edits.
+
+    SELECT_MODES = ("replace", "add", "subtract", "intersect")
+
+    def _selection_bounds(self, doc):
+        """Bounds of the current selection as a result fragment."""
+        sel = doc.selection()
+        if sel is None:
+            return {"selection": None}
+        return {"selection": {"x": sel.x(), "y": sel.y(),
+                              "width": sel.width(), "height": sel.height()}}
+
+    def _mask_selection(self, doc, draw_fn):
+        """Build a Selection from an antialiased 8-bit mask painted by draw_fn.
+
+        One canvas-sized Grayscale8 QImage + QPainter (C++ side, no per-pixel
+        Python). Antialiased edges land as partial selection values, matching
+        Krita's own 8-bit selection semantics.
+        """
+        w, h = doc.width(), doc.height()
+        img = QImage(w, h, QImage.Format_Grayscale8)
+        img.fill(0)
+        painter = QPainter(img)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(QColor(255, 255, 255)))
+        draw_fn(painter)
+        painter.end()
+        # QImage scanlines are 32-bit aligned; strip the row padding.
+        bpl = img.bytesPerLine()
+        raw = img.constBits().asstring(bpl * h)
+        data = raw if bpl == w else b"".join(
+            raw[i * bpl:i * bpl + w] for i in range(h))
+        sel = Selection()
+        sel.setPixelData(data, 0, 0, w, h)
+        return sel
+
+    def _apply_selection(self, doc, new_sel, mode):
+        """Combine new_sel with the document selection. Returns an error dict
+        or None on success."""
+        if mode not in self.SELECT_MODES:
+            return {"error": f"Unknown mode '{mode}'. Valid: {list(self.SELECT_MODES)}"}
+        current = doc.selection()
+        if current is None and mode in ("subtract", "intersect"):
+            return {"error": f"No existing selection to {mode} from"}
+        if mode == "replace" or current is None:
+            doc.setSelection(new_sel)
+            return None
+        if mode == "add":
+            current.add(new_sel)
+        elif mode == "subtract":
+            current.subtract(new_sel)
+        else:
+            current.intersect(new_sel)
+        doc.setSelection(current)
+        return None
+
+    def cmd_select_shape(self, params):
+        """Select a rectangle, ellipse or polygon, combined per `mode`."""
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+        shape = params.get("shape", "rectangle")
+        mode = params.get("mode", "replace")
+
+        if shape == "polygon":
+            points = params.get("points") or []
+            if len(points) < 3:
+                return {"error": "polygon needs at least 3 points"}
+            path = QPainterPath()
+            path.moveTo(points[0][0], points[0][1])
+            for p in points[1:]:
+                path.lineTo(p[0], p[1])
+            path.closeSubpath()
+
+            def draw(painter):
+                painter.drawPath(path)
+        elif shape in ("rectangle", "ellipse"):
+            rect = QRectF(float(params.get("x", 0)), float(params.get("y", 0)),
+                          float(params.get("width", 100)),
+                          float(params.get("height", 100)))
+
+            def draw(painter):
+                if shape == "rectangle":
+                    painter.drawRect(rect)
+                else:
+                    painter.drawEllipse(rect)
+        else:
+            return {"error": f"Unknown shape '{shape}'"}
+
+        err = self._apply_selection(doc, self._mask_selection(doc, draw), mode)
+        if err:
+            return err
+        return {"status": "ok", "shape": shape, "mode": mode,
+                **self._selection_bounds(doc)}
+
+    def cmd_select_all(self, params):
+        """Select the whole canvas."""
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+        sel = Selection()
+        sel.select(0, 0, doc.width(), doc.height(), 255)
+        doc.setSelection(sel)
+        return {"status": "ok", **self._selection_bounds(doc)}
+
+    def cmd_select_none(self, params):
+        """Deselect (clear the global selection)."""
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+        doc.setSelection(None)
+        return {"status": "ok", "selection": None}
+
+    def cmd_select_invert(self, params):
+        """Invert the current selection."""
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+        sel = doc.selection()
+        if sel is None:
+            return {"error": "No active selection to invert (use select_all first)"}
+        sel.invert()
+        doc.setSelection(sel)
+        return {"status": "ok", **self._selection_bounds(doc)}
+
+    def cmd_select_modify(self, params):
+        """Refine the current selection: feather, grow, shrink or border."""
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+        sel = doc.selection()
+        if sel is None:
+            return {"error": "No active selection"}
+        op = params.get("op", "")
+        radius = int(params.get("radius", 0))
+        if radius <= 0:
+            return {"error": "radius must be > 0"}
+        if op == "feather":
+            sel.feather(radius)
+        elif op == "grow":
+            sel.grow(radius, radius)
+        elif op == "shrink":
+            sel.shrink(radius, radius, False)
+        elif op == "border":
+            sel.border(radius, radius)
+        else:
+            return {"error": f"Unknown op '{op}'. Valid: feather, grow, shrink, border"}
+        doc.setSelection(sel)
+        return {"status": "ok", "op": op, "radius": radius,
+                **self._selection_bounds(doc)}
+
+    def cmd_select_info(self, params):
+        """Bounds of the current selection (null if none)."""
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+        return {"status": "ok", **self._selection_bounds(doc)}
+
     # ----- AI Diffusion bridge -----
     # Talks to the Acly/krita-ai-diffusion plugin running in the same Krita process.
     # All calls happen on the main thread (driven by the QTimer in createActions),
