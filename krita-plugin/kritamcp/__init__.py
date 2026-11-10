@@ -4,14 +4,31 @@ Allows Claude (or any MCP client) to paint by sending commands to this plugin.
 """
 
 from krita import *
-from PyQt5.QtCore import (
-    QTimer, QThread, pyqtSignal, QObject, Qt, QPointF, QRectF, QUuid,
-    QByteArray, QBuffer, QIODevice,
-)
-from PyQt5.QtGui import (
-    QColor, QImage, QPainter, QPen, QBrush, QPainterPath,
-)
-from PyQt5.QtWidgets import QMessageBox, QApplication
+
+# Krita 6 ships PyQt6 (Qt6), Krita 5 ships PyQt5 (Qt5). Krita's own `krita`
+# module blocks importing the *other* binding (ModuleNotFoundError), so trying
+# PyQt6 first and falling back to PyQt5 always picks the right one — the same
+# pattern Krita 6's bundled plugins use. Everything below sticks to APIs that
+# exist in both: fully-scoped enums (Qt.PenStyle.NoPen, QImage.Format.Format_X,
+# ...), which PyQt5 5.11+ also accepts, and no exec_().
+try:
+    from PyQt6.QtCore import (
+        QTimer, QThread, pyqtSignal, QObject, Qt, QPointF, QRectF, QUuid,
+        QByteArray, QBuffer, QIODevice,
+    )
+    from PyQt6.QtGui import (
+        QColor, QImage, QPainter, QPen, QBrush, QPainterPath,
+    )
+    from PyQt6.QtWidgets import QMessageBox, QApplication
+except ImportError:
+    from PyQt5.QtCore import (
+        QTimer, QThread, pyqtSignal, QObject, Qt, QPointF, QRectF, QUuid,
+        QByteArray, QBuffer, QIODevice,
+    )
+    from PyQt5.QtGui import (
+        QColor, QImage, QPainter, QPen, QBrush, QPainterPath,
+    )
+    from PyQt5.QtWidgets import QMessageBox, QApplication
 import base64
 import json
 import threading
@@ -261,7 +278,7 @@ class KritaMCPExtension(Extension):
         global dispatcher
         if dispatcher is None:
             dispatcher = CommandDispatcher()
-            dispatcher.pushed.connect(self.process_commands, Qt.QueuedConnection)
+            dispatcher.pushed.connect(self.process_commands, Qt.ConnectionType.QueuedConnection)
 
         # Low-frequency fallback timer in case a signal is ever missed (e.g.
         # a command queued before the dispatcher was wired up). Not the hot path.
@@ -446,7 +463,7 @@ class KritaMCPExtension(Extension):
         the heavy lifting happens in Qt's C++ painter — no per-pixel Python.
 
         bbox is (x, y, w, h) already clamped to the canvas. Krita's U8 RGBA pixel
-        order is BGRA in memory, which is exactly QImage.Format_ARGB32 on
+        order is BGRA in memory, which is exactly QImage.Format.Format_ARGB32 on
         little-endian, so the byte buffers map without conversion.
         """
         x, y, w, h = bbox
@@ -454,12 +471,12 @@ class KritaMCPExtension(Extension):
             return False
 
         existing = bytes(layer.pixelData(x, y, w, h))
-        base = QImage(existing, w, h, QImage.Format_ARGB32).copy()
+        base = QImage(existing, w, h, QImage.Format.Format_ARGB32).copy()
 
-        overlay = QImage(w, h, QImage.Format_ARGB32)
+        overlay = QImage(w, h, QImage.Format.Format_ARGB32)
         overlay.fill(0)  # fully transparent
         painter = QPainter(overlay)
-        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         draw_fn(painter)
         painter.end()
 
@@ -470,11 +487,11 @@ class KritaMCPExtension(Extension):
             sw = max(1, w // (f + 1))
             sh = max(1, h // (f + 1))
             overlay = (overlay
-                       .scaled(sw, sh, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-                       .scaled(w, h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation))
+                       .scaled(sw, sh, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                       .scaled(w, h, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation))
 
         comp = QPainter(base)
-        comp.setCompositionMode(QPainter.CompositionMode_SourceOver)
+        comp.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
         comp.drawImage(0, 0, overlay)
         comp.end()
 
@@ -489,7 +506,7 @@ class KritaMCPExtension(Extension):
         pointer array is ~512 MB for a 4K canvas. QImage.fill writes ARGB32,
         which is BGRA in memory on little-endian — exactly Krita's U8 RGBA order.
         """
-        img = QImage(w, h, QImage.Format_ARGB32)
+        img = QImage(w, h, QImage.Format.Format_ARGB32)
         img.fill(qcolor)
         layer.setPixelData(img.constBits().asstring(w * h * 4), 0, 0, w, h)
 
@@ -536,8 +553,8 @@ class KritaMCPExtension(Extension):
 
         def draw(painter):
             pen = QPen(pen_color, brush_size)
-            pen.setCapStyle(Qt.RoundCap)
-            pen.setJoinStyle(Qt.RoundJoin)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
             painter.setPen(pen)
             painter.drawPath(path)
 
@@ -577,7 +594,7 @@ class KritaMCPExtension(Extension):
             return {"error": "Fill area out of bounds"}
 
         def draw(painter):
-            painter.setPen(Qt.NoPen)
+            painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QBrush(qcolor))
             painter.drawEllipse(QPointF(x - x1, y - y1), radius, radius)
 
@@ -626,7 +643,7 @@ class KritaMCPExtension(Extension):
 
             def draw(painter):
                 pen = QPen(qcolor, line_width)
-                pen.setCapStyle(Qt.RoundCap)
+                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
                 painter.setPen(pen)
                 painter.drawLine(QPointF(x - x1b, y - y1b), QPointF(x2 - x1b, y2 - y1b))
 
@@ -649,11 +666,11 @@ class KritaMCPExtension(Extension):
                 if fill:
                     painter.setBrush(QBrush(qcolor))
                 else:
-                    painter.setBrush(Qt.NoBrush)
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
                 if stroke or not fill:
                     painter.setPen(QPen(qcolor, int(params.get("line_width", 2))))
                 else:
-                    painter.setPen(Qt.NoPen)
+                    painter.setPen(Qt.PenStyle.NoPen)
                 if shape == "rectangle":
                     painter.drawRect(rect)
                 else:
@@ -704,7 +721,7 @@ class KritaMCPExtension(Extension):
 
         ba = QByteArray()
         buf = QBuffer(ba)
-        buf.open(QIODevice.WriteOnly)
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
         if quality >= 0:
             img.save(buf, fmt, quality)
         else:
@@ -790,7 +807,9 @@ class KritaMCPExtension(Extension):
 
         # Get projection pixel data at point
         layer = doc.rootNode()
-        pixel_data = layer.projectionPixelData(x, y, 1, 1)
+        # bytes() so indexing yields ints: indexing a QByteArray returns 1-byte
+        # `bytes` objects in both PyQt5 and PyQt6, which "{:02x}" rejects.
+        pixel_data = bytes(layer.projectionPixelData(x, y, 1, 1))
 
         if len(pixel_data) >= 4:
             # Krita U8 "RGBA" is laid out BGRA in memory (little-endian ARGB32).
@@ -976,11 +995,11 @@ class KritaMCPExtension(Extension):
     def _mask_image(self, doc, draw_fn):
         """Canvas-sized Grayscale8 mask painted by draw_fn (antialiased)."""
         w, h = doc.width(), doc.height()
-        img = QImage(w, h, QImage.Format_Grayscale8)
+        img = QImage(w, h, QImage.Format.Format_Grayscale8)
         img.fill(0)
         painter = QPainter(img)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        painter.setPen(Qt.NoPen)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(QColor(255, 255, 255)))
         draw_fn(painter)
         painter.end()
@@ -1041,7 +1060,7 @@ class KritaMCPExtension(Extension):
             return
         w, h = doc.width(), doc.height()
         data = bytes(sel.pixelData(0, 0, w, h))
-        img = QImage(data, w, h, w, QImage.Format_Grayscale8).copy()
+        img = QImage(data, w, h, w, QImage.Format.Format_Grayscale8).copy()
         self._select_via_layer(doc, img, "replace")
 
     def cmd_select_shape(self, params):
@@ -1171,8 +1190,8 @@ class KritaMCPExtension(Extension):
             return {"error": "Could not decode mask image"}
         w, h = doc.width(), doc.height()
         if img.width() != w or img.height() != h:
-            img = img.scaled(w, h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-        img = img.convertToFormat(QImage.Format_Grayscale8)
+            img = img.scaled(w, h, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        img = img.convertToFormat(QImage.Format.Format_Grayscale8)
         err = self._select_via_layer(doc, img, mode)
         if err:
             return err
