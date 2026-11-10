@@ -1,6 +1,6 @@
 ---
 name: kri
-description: Usar SIEMPRE que haya que controlar Krita desde Claude Code — pintar, crear canvas, mirar el resultado, o manejar AI Diffusion (prompt, estilo, regiones, controles, generación). El comando `kri` habla con el plugin kritamcp por HTTP local. Trigger en cualquier tarea de Krita, dibujo o generación de imágenes vía Krita.
+description: Usar SIEMPRE que haya que controlar Krita desde Claude Code — pintar, crear canvas, capas y máscaras, mirar el resultado, o manejar AI Diffusion (prompt, estilo, regiones, controles, generación). El comando `kri` habla con el plugin kritamcp por HTTP local. Trigger en cualquier tarea de Krita, dibujo o generación de imágenes vía Krita.
 ---
 
 # kri — Krita desde la terminal
@@ -36,7 +36,11 @@ turno cuando necesitás LEER el resultado para decidir el paso siguiente.
    Las actions son los nombres internos del plugin: `new_canvas`, `set_color`,
    `set_brush`, `stroke`, `fill`, `draw_shape`, `clear`, `undo`, `redo`,
    `select_shape`, `select_all`, `select_none`, `select_invert`,
-   `select_modify`, `select_info`,
+   `select_modify`, `select_info`, `select_from_mask`, `select_from_layer`,
+   `select_save`, `select_load`, `layer_list`, `layer_new`, `layer_import`,
+   `layer_export`, `layer_set`, `layer_move`, `layer_select`,
+   `layer_duplicate`, `layer_delete`, `layer_group`, `layer_fill`,
+   `doc_colorspace`,
    `ai_set_prompt`, `ai_set_params`, `ai_set_workspace`, `ai_generate`,
    `ai_create_region`, `ai_select_region`, `ai_add_control`.
    El batch PARA en el primer error (exit 1 con `stopped_at`).
@@ -66,8 +70,8 @@ turno cuando necesitás LEER el resultado para decidir el paso siguiente.
    NO hagas polling manual con `kri ai jobs`.
 
 6. **`kri exec`** (Python arbitrario dentro de Krita) es el ÚLTIMO recurso,
-   solo para lo que de verdad no tiene subcomando (metadata de capas, resize,
-   filtros). **NUNCA para dibujar**: todo lo dibujable sale de
+   solo para lo que de verdad no tiene subcomando (resize, filtros).
+   **NUNCA para dibujar**: todo lo dibujable sale de
    `draw_shape`/`stroke`/`fill` en batch (ver regla 2). Suele estar
    deshabilitado — requiere que Krita haya arrancado con
    `KRITAMCP_ALLOW_EXEC=1`, así que intentarlo a ciegas quema un turno.
@@ -98,9 +102,14 @@ sin tocar el resto (inpaint). Subcomandos: `rect X Y W H`,
     bajo el click / dentro de la caja (estilo SAM2). `--neg-point` = "esta
     parte no". Usalo cuando sabés DÓNDE está lo que querés.
   Preferila sobre rect/ellipse cuando el objetivo es un objeto de la imagen
-  y no una zona geométrica. Primera llamada tarda ~10-30s (carga el modelo);
-  si falla con "Cannot connect", el daemon no está corriendo — decírselo al
-  usuario, no reintentar.
+  y no una zona geométrica. Primera llamada tarda ~10-30s (carga el modelo).
+  Si el daemon está caído, kri le pide al plugin AI Select (SAM) de Krita
+  que lo arranque y reintenta solo; si igual falla con "Cannot connect" (AI
+  Select no instalado), decírselo al usuario, no reintentar.
+  `kri sam status` / `kri sam start` / `kri sam stop` manejan ese daemon.
+  **`--to-layer NOMBRE --color HEX`** además crea una capa rellena con ese
+  color dentro de la selección (`--blend`, `--into GRUPO`/`--above REF`...,
+  `--save-mask NOMBRE` guarda la máscara en esa capa): una parte = un comando.
 - `kri select from-mask archivo.png` = selección desde cualquier máscara en
   escala de grises (blanco = seleccionado).
 - Feather antes de generar (10-20px) para que el parche se funda con el
@@ -113,6 +122,41 @@ Inpaint canónico (tras configurar el prompt para la zona):
 ```bash
 kri select ellipse 300 200 220 180 && kri select feather 15 \
   && kri ai generate --wait && kri ai apply && kri select none && kri look
+```
+
+## Capas y máscaras
+
+`kri layer list` da el árbol (arriba→abajo) con path, id, blend, opacidad,
+visible, locks, activa y bounds, más el espacio de color del documento.
+`REF` = nombre único, path `Grupo/Sub/Capa` desde arriba (`/Capa` fija una
+de primer nivel) o el id. Un nombre repetido falla con la lista de
+candidatos: usá el path o el id que trae. Ubicación (una sola): `--above REF`,
+`--below REF`, `--into GRUPO`, `--top`, `--bottom`; sin ninguna, va arriba de
+la capa activa. Opacidad en %. Blends: ids de Krita o alias (`multiply`,
+`screen`, `overlay`, `soft-light`...); `kri layer blends` los lista.
+
+- **Line art en grises**: un JPG gris abre como GRAYA y toda capa de color
+  sale gris (la respuesta trae `warning`). `kri colorspace RGBA U8` primero.
+- `kri layer import ARCHIVO` lo lee Krita del disco (path absoluto en batch);
+  ~0.5 s por PNG de 3000 px. Armá la estructura ANTES (grupo vacío) e
+  importá `--into GRUPO`: mover o agrupar capas grandes cuesta ~0.5 s c/u.
+- Máscaras de partes: `kri select save NOMBRE --on CAPA` guarda la selección
+  como selection mask; `kri select load NOMBRE` la recupera;
+  `kri select from-layer CAPA` selecciona por el alfa de una capa.
+- `kri layer fill REF HEX [--selection]` respeta alpha lock (recolorea un
+  flat sin cambiar su forma); falla sobre capas bloqueadas.
+- Sombras recortadas a un flat: capa nueva `--blend multiply` +
+  `kri layer set X --inherit-alpha`.
+
+Flats de un line art (estructura en un turno, después una parte por SAM):
+```bash
+kri colorspace RGBA U8 && kri batch <<'EOF'
+[{"action": "layer_set", "params": {"ref": "Fondo", "name": "Line art", "blend": "multiply", "locked": true}},
+ {"action": "layer_new", "params": {"name": "Flats", "type": "group", "below": "Line art"}},
+ {"action": "layer_import", "params": {"path": "/abs/abrigo.png", "name": "Abrigo", "into": "Flats"}}]
+EOF
+kri select sam "the beard" --to-layer Barba --color "#eeeeee" --into Flats \
+  --save-mask "Barba mask" && kri select none && kri look
 ```
 
 ## Flujos canónicos

@@ -26,7 +26,11 @@ import time
 KRITA_URL = os.environ.get("KRITA_URL", "http://127.0.0.1:5678")
 TOKEN = os.environ.get("KRITAMCP_TOKEN", "")
 # Daemon de segmentación (repo krita-autoselect) para `kri select sam`.
+# Sin AUTOSELECT_URL explícita, kri adopta la URL que maneje el plugin
+# AI Select de Krita cuando le pide arrancar el daemon.
 AUTOSELECT_URL = os.environ.get("AUTOSELECT_URL", "http://127.0.0.1:5679")
+AUTOSELECT_URL_EXPLICIT = "AUTOSELECT_URL" in os.environ
+SAM_START_TIMEOUT = 200.0  # AI Select espera hasta 180 s el arranque
 
 WORKSPACES = ["generation", "upscaling", "live", "animation", "custom"]
 JOB_STATES = ["all", "queued", "executing", "finished", "cancelled"]
@@ -79,7 +83,8 @@ def http_request(method, path, body=None, timeout=30.0, url=None, hint=None):
                 chunks.append(chunk)
     except (ConnectionError, socket.gaierror, socket.timeout, OSError) as e:
         suffix = f" — {hint}" if hint else ""
-        return {"error": f"Cannot connect to {url}{suffix} ({e})"}
+        return {"error": f"Cannot connect to {url}{suffix} ({e})",
+                "unreachable": True}
     response = b"".join(chunks)
     head, _, resp_body = response.partition(b"\r\n\r\n")
     try:
@@ -322,11 +327,74 @@ def cmd_select_info(a):
     out(send("select_info"))
 
 
+def sam_ensure(timeout=SAM_START_TIMEOUT):
+    """Ask the AI Select plugin (inside Krita, via kritamcp) to reuse or start
+    its SAM daemon and wait until it answers. Returns (url, None) or
+    (None, reason). Without an explicit AUTOSELECT_URL, the daemon's URL is
+    whatever AI Select is configured with."""
+    params = {"url": AUTOSELECT_URL} if AUTOSELECT_URL_EXPLICIT else {}
+    st = send("sam_start", params, timeout=15.0)
+    if not isinstance(st, dict) or st.get("error"):
+        return None, (st or {}).get("error", "sam_start failed")
+    seq = st.get("seq")
+    if seq is None:  # plugin too old to know sam_start
+        return None, "kritamcp plugin cannot start the SAM daemon (update it)"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(0.5)
+        res = send("sam_status", timeout=10.0)
+        if not isinstance(res, dict) or res.get("error"):
+            return None, (res or {}).get("error", "sam_status failed")
+        start = res.get("start") or {}
+        if start.get("seq") == seq and start.get("done"):
+            if start.get("ok"):
+                return st.get("url") or AUTOSELECT_URL, None
+            return None, start.get("message") or res.get("detail") or "failed"
+    return None, f"SAM daemon not ready after {timeout:.0f}s"
+
+
+def daemon_health(url):
+    res = http_request("GET", "/health", timeout=3.0, url=url)
+    if not isinstance(res, dict) or res.get("error"):
+        return {"url": url, "reachable": False,
+                "error": (res or {}).get("error")}
+    return {"url": url, "reachable": True,
+            **{k: v for k, v in res.items() if k != "status"}}
+
+
+def cmd_sam_status(a):
+    plugin = send("sam_status", {"url": AUTOSELECT_URL}, timeout=10.0)
+    if isinstance(plugin, dict):
+        plugin.pop("status", None)
+        plugin.pop("unreachable", None)
+    out({"status": "ok", "daemon": daemon_health(AUTOSELECT_URL),
+         "ai_select": plugin})
+
+
+def cmd_sam_start(a):
+    if a.no_wait:
+        params = {"url": AUTOSELECT_URL} if AUTOSELECT_URL_EXPLICIT else {}
+        out(send("sam_start", params, timeout=15.0))
+    url, err = sam_ensure(a.timeout)
+    if err:
+        out({"error": f"SAM daemon not started: {err}"})
+    out({"status": "ok", "daemon": daemon_health(url)})
+
+
+def cmd_sam_stop(a):
+    out(send("sam_stop", timeout=15.0))
+
+
 def cmd_select_sam(a):
-    """Canvas → daemon krita-autoselect (SAM 3) → selección en Krita."""
+    """Canvas → daemon krita-autoselect (SAM 3) → selección en Krita.
+    Con --to-layer, además una capa nueva rellena dentro de la selección."""
+    global AUTOSELECT_URL
     if not a.text and not a.point and not a.box and not a.within:
         print("kri: provide a prompt: TEXT, --point, --box and/or --within",
               file=sys.stderr)
+        sys.exit(2)
+    if a.to_layer and a.list:
+        print("kri: --to-layer and --list don't go together", file=sys.stderr)
         sys.exit(2)
     canvas = send("get_canvas", {"mode": "full"}, timeout=120.0)
     if not isinstance(canvas, dict) or canvas.get("error"):
@@ -340,7 +408,7 @@ def cmd_select_sam(a):
         points.append(parse_points([token])[0])
         labels.append(0)
 
-    payload = clean(
+    payload = json.dumps(clean(
         image_b64=canvas["data_b64"],
         text=a.text,
         points=points or None,
@@ -350,25 +418,62 @@ def cmd_select_sam(a):
         threshold=a.threshold,
         combine="union" if a.instance is None else a.instance,
         list_only=True if a.list else None,
-    )
-    res = http_request(
-        "POST", "/segment", json.dumps(payload).encode(),
-        timeout=a.timeout, url=AUTOSELECT_URL,
-        hint=("is the krita-autoselect daemon running? "
-              "(python server.py in the krita-autoselect repo)"))
+    )).encode()
+    hint = ("is the krita-autoselect daemon running? Start it from the "
+            "AI Select (SAM) docker in Krita, or `kri sam start`")
+
+    def segment():
+        return http_request("POST", "/segment", payload, timeout=a.timeout,
+                            url=AUTOSELECT_URL, hint=hint)
+
+    res = segment()
+    if isinstance(res, dict) and res.get("unreachable"):
+        # Daemon caído: que AI Select (dentro de Krita) lo arranque.
+        url, err = sam_ensure()
+        if url:
+            AUTOSELECT_URL = url
+            res = segment()
+        else:
+            res["error"] += f" [auto-start via AI Select failed: {err}]"
     if not isinstance(res, dict) or res.get("error") or a.list:
         out(res)
     if not res.get("count") or not res.get("mask_b64"):
         out({"error": "no instances found for that prompt",
              "instances": res.get("instances", [])})
 
-    applied = send("select_from_mask",
-                   {"mask_b64": res["mask_b64"], "mode": a.mode})
-    if not isinstance(applied, dict) or applied.get("error"):
-        out(applied)
-    out({"status": "ok", "count": res["count"],
-         "instances": res["instances"],
-         "selection": applied.get("selection")})
+    apply = {"action": "select_from_mask",
+             "params": {"mask_b64": res["mask_b64"], "mode": a.mode}}
+    result = {"status": "ok", "count": res["count"],
+              "instances": res["instances"]}
+    if a.to_layer:
+        layer = {"action": "layer_new", "params": clean(
+            name=a.to_layer, color=a.color or "#ffffff", selection=True,
+            blend=a.blend,
+            opacity=a.opacity, **placement(a))}
+        batch = send("batch", {"commands": [apply, layer],
+                               "stop_on_error": True}, timeout=120.0)
+        if not isinstance(batch, dict) or batch.get("error"):
+            out(batch)
+        results = batch.get("results") or [{}]
+        if batch.get("stopped_at") is not None:
+            out({**results[-1], "step": ["select_from_mask", "layer_new"]
+                 [batch["stopped_at"]]})
+        result["selection"] = results[0].get("selection")
+        result["layer"] = results[1].get("layer")
+        if results[1].get("warning"):
+            result["warning"] = results[1]["warning"]
+    else:
+        applied = send(apply["action"], apply["params"])
+        if not isinstance(applied, dict) or applied.get("error"):
+            out(applied)
+        result["selection"] = applied.get("selection")
+    if a.save_mask:
+        on = result["layer"]["id"] if a.to_layer else None
+        saved = send("select_save", clean(name=a.save_mask, on=on))
+        if not isinstance(saved, dict) or saved.get("error"):
+            out({**saved, "partial": result})
+        result["mask"] = saved.get("mask")
+    out(result)
 
 
 def cmd_select_from_mask(a):
@@ -380,6 +485,111 @@ def cmd_select_from_mask(a):
         print(f"kri: cannot read mask file: {e}", file=sys.stderr)
         sys.exit(2)
     out(send("select_from_mask", {"mask_b64": mask_b64, "mode": a.mode}))
+
+
+def cmd_select_from_layer(a):
+    out(send("select_from_layer", {"ref": a.ref, "mode": a.mode}))
+
+
+def cmd_select_save(a):
+    out(send("select_save", clean(name=a.name, on=a.on)))
+
+
+def cmd_select_load(a):
+    out(send("select_load", {"name": a.name, "mode": a.mode}))
+
+
+# ----- Capas -----
+
+def placement(a):
+    """--above/--below/--into/--top/--bottom → plugin params (at most one)."""
+    return clean(above=a.above, below=a.below, into=a.into,
+                 top=a.top or None, bottom=a.bottom or None)
+
+
+def cmd_layer_list(a):
+    out(send("layer_list"))
+
+
+def cmd_layer_blends(a):
+    out(send("layer_blends"))
+
+
+def cmd_layer_new(a):
+    if a.selection and not a.color:
+        print("kri: --selection needs --color", file=sys.stderr)
+        sys.exit(2)
+    out(send("layer_new", clean(
+        name=a.name, type=a.type, blend=a.blend, opacity=a.opacity,
+        hidden=a.hidden or None, color=a.color, selection=a.selection or None,
+        **placement(a))))
+
+
+def cmd_layer_import(a):
+    path = os.path.abspath(os.path.expanduser(a.file))
+    if not os.path.isfile(path):
+        print(f"kri: file not found: {a.file}", file=sys.stderr)
+        sys.exit(2)
+    out(send("layer_import", clean(
+        path=path, name=a.name, x=a.x, y=a.y, blend=a.blend,
+        opacity=a.opacity, hidden=a.hidden or None, **placement(a)),
+        timeout=120.0))
+
+
+def cmd_layer_export(a):
+    out(send("layer_export", clean(
+        ref=a.ref, path=os.path.abspath(os.path.expanduser(a.path)),
+        crop=a.crop or None), timeout=120.0))
+
+
+def cmd_layer_set(a):
+    params = clean(name=a.rename, blend=a.blend, opacity=a.opacity,
+                   visible=a.visible, locked=a.locked,
+                   alpha_locked=a.alpha_locked, inherit_alpha=a.inherit_alpha)
+    if not params:
+        print("kri: nothing to change (see kri layer set --help)",
+              file=sys.stderr)
+        sys.exit(2)
+    out(send("layer_set", {"ref": a.ref, **params}))
+
+
+def cmd_layer_move(a):
+    where = placement(a)
+    if not where:
+        print("kri: say where: --above/--below REF, --into GROUP, "
+              "--top or --bottom", file=sys.stderr)
+        sys.exit(2)
+    out(send("layer_move", {"ref": a.ref, **where}))
+
+
+def cmd_layer_select(a):
+    out(send("layer_select", {"ref": a.ref}))
+
+
+def cmd_layer_duplicate(a):
+    out(send("layer_duplicate", clean(ref=a.ref, name=a.name, **placement(a))))
+
+
+def cmd_layer_delete(a):
+    out(send("layer_delete", {"refs": a.refs}))
+
+
+def cmd_layer_group(a):
+    out(send("layer_group", clean(name=a.name, refs=a.refs, blend=a.blend,
+                                  opacity=a.opacity)))
+
+
+def cmd_layer_fill(a):
+    out(send("layer_fill", clean(ref=a.ref, color=a.color,
+                                 selection=a.selection or None)))
+
+
+def cmd_colorspace(a):
+    if a.depth and not a.model:
+        print("kri: give MODEL before DEPTH", file=sys.stderr)
+        sys.exit(2)
+    out(send("doc_colorspace", clean(model=a.model, depth=a.depth,
+                                     profile=a.profile), timeout=120.0))
 
 
 # ----- AI Diffusion -----
@@ -491,6 +701,22 @@ def build_parser():
         description="CLI bridge to Krita (kritamcp plugin). Prints JSON; errors exit 1.",
     )
     sub = p.add_subparsers(dest="cmd", required=True, metavar="command")
+
+    def _place(sp, what="the layer"):
+        g = sp.add_mutually_exclusive_group()
+        g.add_argument("--above", metavar="REF", help=f"put {what} right above REF")
+        g.add_argument("--below", metavar="REF", help=f"put {what} right below REF")
+        g.add_argument("--into", metavar="GROUP", help=f"put {what} on top inside GROUP")
+        g.add_argument("--top", action="store_true", default=None,
+                       help="top of the whole stack")
+        g.add_argument("--bottom", action="store_true", default=None,
+                       help="bottom of the whole stack")
+
+    def _look(sp):
+        sp.add_argument("--blend", metavar="MODE",
+                        help="blending mode id or alias (kri layer blends)")
+        sp.add_argument("--opacity", type=float, metavar="PCT",
+                        help="opacity 0-100")
 
     sp = sub.add_parser("health", help="check the plugin is up")
     sp.set_defaults(fn=cmd_health)
@@ -666,6 +892,16 @@ def build_parser():
                     help="only print instances (score + bbox), don't select")
     sp.add_argument("--timeout", type=float, default=120.0,
                     help="seconds to wait (first call loads the model)")
+    sp.add_argument("--to-layer", metavar="NAME", dest="to_layer",
+                    help="also create a paint layer NAME filled with --color "
+                         "inside the new selection")
+    sp.add_argument("--color", metavar="HEX",
+                    help="fill colour for --to-layer (default #ffffff)")
+    _look(sp)
+    _place(sp, "the --to-layer layer")
+    sp.add_argument("--save-mask", metavar="NAME", dest="save_mask",
+                    help="also store the selection as a selection mask NAME "
+                         "(on the --to-layer layer, else the active one)")
     _sel_mode(sp)
     sp.set_defaults(fn=cmd_select_sam)
 
@@ -674,6 +910,142 @@ def build_parser():
     sp.add_argument("file")
     _sel_mode(sp)
     sp.set_defaults(fn=cmd_select_from_mask)
+
+    sp = sel.add_parser("from-layer",
+                        help="selection from a layer's alpha (Select Opaque)")
+    sp.add_argument("ref", metavar="REF")
+    _sel_mode(sp)
+    sp.set_defaults(fn=cmd_select_from_layer)
+
+    sp = sel.add_parser("save", help="store the selection as a named "
+                                     "selection mask on a layer")
+    sp.add_argument("name")
+    sp.add_argument("--on", metavar="REF",
+                    help="layer that holds the mask (default: active layer)")
+    sp.set_defaults(fn=cmd_select_save)
+
+    sp = sel.add_parser("load", help="restore a selection saved with "
+                                     "`kri select save`")
+    sp.add_argument("name", help="selection mask name, path or id")
+    _sel_mode(sp)
+    sp.set_defaults(fn=cmd_select_load)
+
+    lay = sub.add_parser(
+        "layer", help="layers: list/new/import/export/set/move/group/fill..."
+    ).add_subparsers(dest="layer_cmd", required=True, metavar="layer-command")
+    ref_help = "layer: unique name, Group/Sub/Layer path or id"
+
+    sp = lay.add_parser("list", help="layer tree, top to bottom, with properties")
+    sp.set_defaults(fn=cmd_layer_list)
+
+    sp = lay.add_parser("blends", help="valid blending modes and aliases")
+    sp.set_defaults(fn=cmd_layer_blends)
+
+    sp = lay.add_parser("new", help="new paint/group layer (becomes active)")
+    sp.add_argument("name")
+    sp.add_argument("--type", choices=["paint", "group"], default=None)
+    _place(sp)
+    _look(sp)
+    sp.add_argument("--hidden", action="store_true")
+    sp.add_argument("--color", metavar="HEX", help="fill the layer with it")
+    sp.add_argument("--selection", action="store_true",
+                    help="with --color: fill only inside the current selection")
+    sp.set_defaults(fn=cmd_layer_new)
+
+    sp = lay.add_parser("import", help="PNG/JPG (alpha kept) into a new "
+                                       "paint layer; Krita reads the file")
+    sp.add_argument("file")
+    sp.add_argument("--name", help="layer name (default: file name)")
+    sp.add_argument("--x", type=int, default=None)
+    sp.add_argument("--y", type=int, default=None)
+    _place(sp)
+    _look(sp)
+    sp.add_argument("--hidden", action="store_true")
+    sp.set_defaults(fn=cmd_layer_import)
+
+    sp = lay.add_parser("export", help="layer pixels to a PNG with alpha "
+                                       "(canvas-sized)")
+    sp.add_argument("ref", metavar="REF", help=ref_help)
+    sp.add_argument("path")
+    sp.add_argument("--crop", action="store_true",
+                    help="crop to the layer bounds instead of the canvas")
+    sp.set_defaults(fn=cmd_layer_export)
+
+    sp = lay.add_parser("set", help="rename / blend / opacity / visibility / locks")
+    sp.add_argument("ref", metavar="REF", help=ref_help)
+    sp.add_argument("--name", dest="rename", metavar="NEW_NAME")
+    _look(sp)
+    vis = sp.add_mutually_exclusive_group()
+    vis.add_argument("--visible", dest="visible", action="store_const",
+                     const=True, default=None)
+    vis.add_argument("--hidden", dest="visible", action="store_const",
+                     const=False)
+    lock = sp.add_mutually_exclusive_group()
+    lock.add_argument("--lock", dest="locked", action="store_const",
+                      const=True, default=None)
+    lock.add_argument("--unlock", dest="locked", action="store_const",
+                      const=False)
+    sp.add_argument("--alpha-lock", dest="alpha_locked",
+                    action=argparse.BooleanOptionalAction, default=None)
+    sp.add_argument("--inherit-alpha", dest="inherit_alpha",
+                    action=argparse.BooleanOptionalAction, default=None,
+                    help="clip to the layers below (Krita's alpha inheritance)")
+    sp.set_defaults(fn=cmd_layer_set)
+
+    sp = lay.add_parser("move", help="move a layer: --above/--below/--into/"
+                                     "--top/--bottom")
+    sp.add_argument("ref", metavar="REF", help=ref_help)
+    _place(sp)
+    sp.set_defaults(fn=cmd_layer_move)
+
+    sp = lay.add_parser("select", help="make a layer the active one")
+    sp.add_argument("ref", metavar="REF", help=ref_help)
+    sp.set_defaults(fn=cmd_layer_select)
+
+    sp = lay.add_parser("duplicate", help="copy a layer (above it by default)")
+    sp.add_argument("ref", metavar="REF", help=ref_help)
+    sp.add_argument("--name", help="default: '<name> copy'")
+    _place(sp, "the copy")
+    sp.set_defaults(fn=cmd_layer_duplicate)
+
+    sp = lay.add_parser("delete", help="delete one or more layers")
+    sp.add_argument("refs", metavar="REF", nargs="+", help=ref_help)
+    sp.set_defaults(fn=cmd_layer_delete)
+
+    sp = lay.add_parser("group", help="wrap layers in a new group: "
+                                      "kri layer group NAME REF...")
+    sp.add_argument("name")
+    sp.add_argument("refs", metavar="REF", nargs="+", help=ref_help)
+    _look(sp)
+    sp.set_defaults(fn=cmd_layer_group)
+
+    sp = lay.add_parser("fill", help="fill a paint layer with a colour "
+                                     "(whole canvas, or --selection)")
+    sp.add_argument("ref", metavar="REF", help=ref_help)
+    sp.add_argument("color", metavar="HEX")
+    sp.add_argument("--selection", action="store_true",
+                    help="only inside the current selection")
+    sp.set_defaults(fn=cmd_layer_fill)
+
+    sam = sub.add_parser(
+        "sam", help="SAM daemon (krita-autoselect) via the AI Select plugin"
+    ).add_subparsers(dest="sam_cmd", required=True, metavar="sam-command")
+    sp = sam.add_parser("status", help="is the daemon up? what AI Select manages")
+    sp.set_defaults(fn=cmd_sam_status)
+    sp = sam.add_parser("start", help="have AI Select start the daemon and "
+                                      "wait until it answers")
+    sp.add_argument("--no-wait", action="store_true", dest="no_wait")
+    sp.add_argument("--timeout", type=float, default=SAM_START_TIMEOUT)
+    sp.set_defaults(fn=cmd_sam_start)
+    sp = sam.add_parser("stop", help="stop the daemon AI Select started")
+    sp.set_defaults(fn=cmd_sam_stop)
+
+    sp = sub.add_parser("colorspace", help="show the image colour space, or "
+                                           "convert it: kri colorspace RGBA U8")
+    sp.add_argument("model", nargs="?", help="RGBA, GRAYA, CMYKA, LABA, ...")
+    sp.add_argument("depth", nargs="?", help="U8, U16, F16, F32 (default U8)")
+    sp.add_argument("--profile", help="ICC profile name (default: sRGB/gray elle)")
+    sp.set_defaults(fn=cmd_colorspace)
 
     ai = sub.add_parser("ai", help="AI Diffusion plugin").add_subparsers(
         dest="ai_cmd", required=True, metavar="ai-command")

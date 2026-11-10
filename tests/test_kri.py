@@ -7,6 +7,7 @@ KRITA_URL pointed at the fake server."""
 import base64
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,7 @@ KRI = os.path.join(REPO, "cli", "kri")
 class FakePlugin(BaseHTTPRequestHandler):
     requests_log = []
     responses = {}
+    hooks = {}  # action -> callable(cmd), run before answering
 
     def log_message(self, fmt, *args):
         pass
@@ -32,6 +34,9 @@ class FakePlugin(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", 0))
         cmd = json.loads(self.rfile.read(n))
         FakePlugin.requests_log.append(cmd)
+        hook = FakePlugin.hooks.get(cmd["action"])
+        if hook:
+            hook(cmd)
         r = FakePlugin.responses.get(cmd["action"], {"status": "ok"})
         if isinstance(r, list):
             r = r.pop(0) if len(r) > 1 else r[0]
@@ -53,6 +58,14 @@ class FakeDaemon(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         pass
+
+    def do_GET(self):  # /health
+        r = FakeDaemon.response or {"status": "ok"}
+        body = json.dumps(r).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0))
@@ -86,6 +99,7 @@ class KriTest(unittest.TestCase):
     def setUp(self):
         FakePlugin.requests_log.clear()
         FakePlugin.responses = {}
+        FakePlugin.hooks = {}
         FakeDaemon.requests_log.clear()
         FakeDaemon.response = {}
 
@@ -492,7 +506,10 @@ class KriTest(unittest.TestCase):
         self.assertIn("prompt", r.stderr)
 
     def test_select_sam_daemon_down_mentions_daemon(self):
+        """AI Select ausente → el error conserva el hint de siempre."""
         self._sam_ready()
+        FakePlugin.responses["sam_start"] = {
+            "error": "AI Select (SAM) plugin not loaded", "ai_select": False}
         env = dict(os.environ,
                    KRITA_URL=f"http://localhost:{self.port}",
                    AUTOSELECT_URL="http://localhost:1")
@@ -500,6 +517,328 @@ class KriTest(unittest.TestCase):
                            capture_output=True, text=True, env=env, timeout=30)
         self.assertEqual(r.returncode, 1)
         self.assertIn("krita-autoselect", r.stderr)
+        self.assertIn("AI Select", r.stderr)
+        # le pidió al plugin que arranque el daemon, con la URL explícita
+        start = [q for q in FakePlugin.requests_log if q["action"] == "sam_start"]
+        self.assertEqual(start[0]["params"], {"url": "http://localhost:1"})
+        self.assertNotIn("select_from_mask",
+                         [q["action"] for q in FakePlugin.requests_log])
+
+    def test_select_sam_autostarts_daemon_via_ai_select(self):
+        """Daemon caído → sam_start en el plugin → espera start.done → reintenta."""
+        self._sam_ready()
+        with socket.socket() as probe:
+            probe.bind(("localhost", 0))
+            port = probe.getsockname()[1]
+        url = f"http://localhost:{port}"
+        started = []
+
+        def start_daemon(cmd):  # lo que haría AI Select: levantar el daemon
+            srv = HTTPServer(("localhost", port), FakeDaemon)
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            started.append(srv)
+
+        FakePlugin.hooks["sam_start"] = start_daemon
+        FakePlugin.responses["sam_start"] = {"status": "ok", "seq": 3, "url": url}
+        FakePlugin.responses["sam_status"] = [
+            {"status": "ok", "state": "starting", "start": {"seq": 3, "done": False}},
+            {"status": "ok", "state": "ready",
+             "start": {"seq": 3, "done": True, "ok": True, "message": ""}},
+        ]
+        env = dict(os.environ, KRITA_URL=f"http://localhost:{self.port}",
+                   AUTOSELECT_URL=url)
+        try:
+            r = subprocess.run([sys.executable, KRI, "select", "sam", "car"],
+                               capture_output=True, text=True, env=env,
+                               timeout=30)
+        finally:
+            for srv in started:
+                srv.shutdown()
+                srv.server_close()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(FakeDaemon.requests_log), 1)
+        actions = [q["action"] for q in FakePlugin.requests_log]
+        self.assertEqual(actions[:2], ["get_canvas", "sam_start"])
+        self.assertEqual(actions.count("sam_status"), 2)
+        self.assertEqual(actions[-1], "select_from_mask")
+
+    def test_select_sam_autostart_failure_reports_reason(self):
+        self._sam_ready()
+        FakePlugin.responses["sam_start"] = {"status": "ok", "seq": 1}
+        FakePlugin.responses["sam_status"] = {
+            "status": "ok", "state": "error",
+            "start": {"seq": 1, "done": True, "ok": False,
+                      "message": "backend did not start (exit 3)"}}
+        env = dict(os.environ, KRITA_URL=f"http://localhost:{self.port}",
+                   AUTOSELECT_URL="http://localhost:1")
+        r = subprocess.run([sys.executable, KRI, "select", "sam", "car"],
+                           capture_output=True, text=True, env=env, timeout=30)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("backend did not start (exit 3)", r.stderr)
+
+    def test_select_sam_to_layer_creates_filled_layer_in_one_batch(self):
+        self._sam_ready()
+        FakePlugin.responses["batch"] = {
+            "status": "ok", "count": 2, "results": [
+                {"status": "ok", "selection": {"x": 1, "y": 2,
+                                               "width": 3, "height": 4}},
+                {"status": "ok", "layer": {"name": "beard", "id": "abc-1"}}]}
+        r = self.kri("select", "sam", "the beard", "--to-layer", "beard",
+                     "--color", "#eeeeee", "--blend", "multiply",
+                     "--below", "Line art")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        req = self.last_request()
+        self.assertEqual(req["action"], "batch")
+        self.assertTrue(req["params"]["stop_on_error"])
+        sel, layer = req["params"]["commands"]
+        self.assertEqual(sel["action"], "select_from_mask")
+        self.assertEqual(sel["params"]["mode"], "replace")
+        self.assertEqual(layer, {"action": "layer_new", "params": {
+            "name": "beard", "color": "#eeeeee", "selection": True,
+            "blend": "multiply", "below": "Line art"}})
+        res = json.loads(r.stdout)
+        self.assertEqual(res["layer"]["id"], "abc-1")
+        self.assertEqual(res["selection"]["width"], 3)
+
+    def test_select_sam_to_layer_defaults_white_and_saves_mask(self):
+        self._sam_ready()
+        FakePlugin.responses["batch"] = {
+            "status": "ok", "count": 2, "results": [
+                {"status": "ok", "selection": None},
+                {"status": "ok", "layer": {"name": "coat", "id": "id-9"}}]}
+        FakePlugin.responses["select_save"] = {
+            "status": "ok", "mask": {"name": "coat mask"}}
+        r = self.kri("select", "sam", "coat", "--to-layer", "coat",
+                     "--save-mask", "coat mask")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        batch = [q for q in FakePlugin.requests_log if q["action"] == "batch"][0]
+        self.assertEqual(batch["params"]["commands"][1]["params"]["color"],
+                         "#ffffff")
+        self.assertEqual(self.last_request(), {
+            "action": "select_save", "timeout": 30.0,
+            "params": {"name": "coat mask", "on": "id-9"}})
+        self.assertEqual(json.loads(r.stdout)["mask"]["name"], "coat mask")
+
+    def test_select_sam_to_layer_error_names_failing_step(self):
+        self._sam_ready()
+        FakePlugin.responses["batch"] = {
+            "status": "ok", "count": 2, "stopped_at": 1, "results": [
+                {"status": "ok"}, {"error": "Layer not found: 'Lineart'"}]}
+        r = self.kri("select", "sam", "coat", "--to-layer", "coat",
+                     "--above", "Lineart")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("Layer not found", r.stderr)
+        self.assertIn("layer_new", r.stderr)
+
+    def test_select_sam_to_layer_rejects_list(self):
+        r = self.kri("select", "sam", "coat", "--to-layer", "coat", "--list")
+        self.assertEqual(r.returncode, 2)
+
+    # ----- capas -----
+
+    def test_layer_command_mappings(self):
+        cases = [
+            (["layer", "list"], "layer_list", {}),
+            (["layer", "blends"], "layer_blends", {}),
+            (["layer", "new", "Flats", "--type", "group", "--top"],
+             "layer_new", {"name": "Flats", "type": "group", "top": True}),
+            (["layer", "new", "beard", "--below", "Line art", "--blend",
+              "soft-light", "--opacity", "80", "--hidden", "--color", "#fff"],
+             "layer_new", {"name": "beard", "below": "Line art",
+                           "blend": "soft-light", "opacity": 80.0,
+                           "hidden": True, "color": "#fff"}),
+            (["layer", "new", "beard", "--color", "#fff", "--selection",
+              "--into", "Flats"],
+             "layer_new", {"name": "beard", "color": "#fff",
+                           "selection": True, "into": "Flats"}),
+            (["layer", "set", "Line art", "--blend", "multiply",
+              "--opacity", "90", "--hidden", "--lock", "--alpha-lock",
+              "--no-inherit-alpha", "--name", "Ink"],
+             "layer_set", {"ref": "Line art", "name": "Ink",
+                           "blend": "multiply", "opacity": 90.0,
+                           "visible": False, "locked": True,
+                           "alpha_locked": True, "inherit_alpha": False}),
+            (["layer", "set", "Ink", "--visible", "--unlock",
+              "--no-alpha-lock"],
+             "layer_set", {"ref": "Ink", "visible": True, "locked": False,
+                           "alpha_locked": False}),
+            (["layer", "move", "Line art", "--top"],
+             "layer_move", {"ref": "Line art", "top": True}),
+            (["layer", "move", "Flats/beard", "--above", "coat"],
+             "layer_move", {"ref": "Flats/beard", "above": "coat"}),
+            (["layer", "move", "beard", "--bottom"],
+             "layer_move", {"ref": "beard", "bottom": True}),
+            (["layer", "select", "beard"], "layer_select", {"ref": "beard"}),
+            (["layer", "duplicate", "beard", "--name", "beard 2", "--into",
+              "Flats"],
+             "layer_duplicate", {"ref": "beard", "name": "beard 2",
+                                 "into": "Flats"}),
+            (["layer", "delete", "a", "Flats/b"],
+             "layer_delete", {"refs": ["a", "Flats/b"]}),
+            (["layer", "group", "Flats", "beard", "coat", "--blend",
+              "normal"],
+             "layer_group", {"name": "Flats", "refs": ["beard", "coat"],
+                             "blend": "normal"}),
+            (["layer", "fill", "beard", "#112233"],
+             "layer_fill", {"ref": "beard", "color": "#112233"}),
+            (["layer", "fill", "beard", "#112233", "--selection"],
+             "layer_fill", {"ref": "beard", "color": "#112233",
+                            "selection": True}),
+            (["colorspace"], "doc_colorspace", {}),
+            (["colorspace", "RGBA", "U16"],
+             "doc_colorspace", {"model": "RGBA", "depth": "U16"}),
+        ]
+        for argv, action, params in cases:
+            with self.subTest(argv=argv):
+                FakePlugin.requests_log.clear()
+                r = self.kri(*argv)
+                self.assertEqual(r.returncode, 0, f"{argv}: {r.stderr}")
+                req = self.last_request()
+                self.assertEqual(req["action"], action)
+                self.assertEqual(req["params"], params)
+
+    def test_layer_import_sends_absolute_path_not_pixels(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "beard.png")
+            with open(path, "wb") as f:
+                f.write(b"png")
+            r = subprocess.run(
+                [sys.executable, KRI, "layer", "import", "beard.png",
+                 "--name", "Beard", "--x", "10", "--y", "-5", "--above",
+                 "coat", "--blend", "multiply", "--opacity", "50"],
+                capture_output=True, text=True, cwd=d, timeout=30,
+                env=dict(os.environ, KRITA_URL=f"http://localhost:{self.port}"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        req = self.last_request()
+        self.assertEqual(req["action"], "layer_import")
+        self.assertEqual(req["params"], {
+            "path": path, "name": "Beard", "x": 10, "y": -5,
+            "above": "coat", "blend": "multiply", "opacity": 50.0})
+        self.assertGreaterEqual(req["timeout"], 120.0)
+
+    def test_layer_import_missing_file_exits_2(self):
+        r = self.kri("layer", "import", "/nonexistent/x.png")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("not found", r.stderr)
+        self.assertEqual(FakePlugin.requests_log, [])
+
+    def test_layer_export_absolute_path(self):
+        r = self.kri("layer", "export", "beard", "out/beard.png", "--crop")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        params = self.last_request()["params"]
+        self.assertTrue(os.path.isabs(params["path"]))
+        self.assertTrue(params["path"].endswith("out/beard.png"))
+        self.assertEqual(params["ref"], "beard")
+        self.assertTrue(params["crop"])
+
+    def test_layer_placement_flags_are_exclusive(self):
+        r = self.kri("layer", "new", "x", "--top", "--below", "y")
+        self.assertEqual(r.returncode, 2)
+        self.assertEqual(FakePlugin.requests_log, [])
+
+    def test_layer_usage_errors_exit_2(self):
+        for argv in (["layer", "set", "beard"],
+                     ["layer", "move", "beard"],
+                     ["layer", "new", "x", "--selection"],
+                     ["layer", "set", "x", "--visible", "--hidden"],
+                     ["layer", "group", "G"]):
+            with self.subTest(argv=argv):
+                r = self.kri(*argv)
+                self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertEqual(FakePlugin.requests_log, [])
+
+    def test_layer_ambiguous_ref_lists_candidates(self):
+        FakePlugin.responses["layer_select"] = {
+            "error": "Ambiguous layer 'beard': 2 match (beard, Flats/beard)",
+            "candidates": [{"path": "beard", "id": "a"},
+                           {"path": "Flats/beard", "id": "b"}]}
+        r = self.kri("layer", "select", "beard")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("Flats/beard", r.stderr)
+        self.assertIn("candidates", r.stderr)
+
+    def test_select_mask_mappings(self):
+        cases = [
+            (["select", "from-layer", "beard"],
+             "select_from_layer", {"ref": "beard", "mode": "replace"}),
+            (["select", "from-layer", "Flats/coat", "--mode", "add"],
+             "select_from_layer", {"ref": "Flats/coat", "mode": "add"}),
+            (["select", "save", "beard mask"],
+             "select_save", {"name": "beard mask"}),
+            (["select", "save", "beard mask", "--on", "beard"],
+             "select_save", {"name": "beard mask", "on": "beard"}),
+            (["select", "load", "beard mask", "--mode", "subtract"],
+             "select_load", {"name": "beard mask", "mode": "subtract"}),
+        ]
+        for argv, action, params in cases:
+            with self.subTest(argv=argv):
+                FakePlugin.requests_log.clear()
+                r = self.kri(*argv)
+                self.assertEqual(r.returncode, 0, f"{argv}: {r.stderr}")
+                req = self.last_request()
+                self.assertEqual(req["action"], action)
+                self.assertEqual(req["params"], params)
+
+    # ----- sam (daemon vía AI Select) -----
+
+    def test_sam_status_merges_plugin_and_daemon_health(self):
+        FakePlugin.responses["sam_status"] = {
+            "status": "ok", "ai_select": True, "state": "ready",
+            "url": "http://127.0.0.1:5679"}
+        FakeDaemon.response = {"status": "ok", "service": "krita-autoselect"}
+        r = self.kri("sam", "status")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        res = json.loads(r.stdout)
+        self.assertEqual(res["ai_select"]["state"], "ready")
+        self.assertTrue(res["daemon"]["reachable"])
+        self.assertEqual(res["daemon"]["service"], "krita-autoselect")
+        self.assertEqual(self.last_request()["params"]["url"],
+                         f"http://localhost:{self.daemon_port}")
+
+    def test_sam_status_reports_down_daemon_without_failing(self):
+        FakePlugin.responses["sam_status"] = {
+            "status": "ok", "ai_select": False, "detail": "not loaded"}
+        env = dict(os.environ, KRITA_URL=f"http://localhost:{self.port}",
+                   AUTOSELECT_URL="http://localhost:1")
+        r = subprocess.run([sys.executable, KRI, "sam", "status"],
+                           capture_output=True, text=True, env=env, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        res = json.loads(r.stdout)
+        self.assertFalse(res["daemon"]["reachable"])
+        self.assertFalse(res["ai_select"]["ai_select"])
+
+    def test_sam_start_waits_for_ready(self):
+        FakePlugin.responses["sam_start"] = {
+            "status": "ok", "seq": 7,
+            "url": f"http://localhost:{self.daemon_port}"}
+        FakePlugin.responses["sam_status"] = [
+            {"status": "ok", "start": {"seq": 6, "done": True, "ok": False}},
+            {"status": "ok", "start": {"seq": 7, "done": True, "ok": True}}]
+        r = self.kri("sam", "start")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        res = json.loads(r.stdout)
+        self.assertTrue(res["daemon"]["reachable"])
+        statuses = [q for q in FakePlugin.requests_log
+                    if q["action"] == "sam_status"]
+        self.assertEqual(len(statuses), 2)  # ignoró el resultado viejo (seq 6)
+
+    def test_sam_start_no_wait_and_stop(self):
+        FakePlugin.responses["sam_start"] = {"status": "ok", "seq": 1}
+        r = self.kri("sam", "start", "--no-wait")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.last_request()["action"], "sam_start")
+        self.assertEqual(len(FakePlugin.requests_log), 1)
+        r = self.kri("sam", "stop")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.last_request()["action"], "sam_stop")
+
+    def test_sam_start_url_mismatch_error_surfaces(self):
+        FakePlugin.responses["sam_start"] = {
+            "error": "AI Select manages the daemon at http://127.0.0.1:5679",
+            "url": "http://127.0.0.1:5679"}
+        r = self.kri("sam", "start")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("AI Select manages", r.stderr)
 
     def test_select_from_mask_file(self):
         FakePlugin.responses["select_from_mask"] = {
