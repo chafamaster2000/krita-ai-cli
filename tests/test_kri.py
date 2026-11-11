@@ -931,6 +931,43 @@ class KriTest(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("KRITAMCP_ALLOW_EXEC", r.stderr)
 
+    # ----- diálogo modal (fix/krita-live) -----
+
+    def test_dialog_maps_to_modal_dialog(self):
+        FakePlugin.responses["modal_dialog"] = {
+            "status": "ok", "modal": {"class": "QMessageBox", "title": "Krita",
+                                      "text": "Ha ocurrido un problema"},
+            "dismissed": False}
+        r = self.kri("dialog")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.last_request()["action"], "modal_dialog")
+        self.assertEqual(self.last_request()["params"], {"dismiss": False})
+        self.assertIn("QMessageBox", r.stdout)
+
+    def test_dialog_dismiss(self):
+        r = self.kri("dialog", "--dismiss")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.last_request()["params"], {"dismiss": True})
+
+    def test_blocked_by_modal_error_is_passed_through(self):
+        FakePlugin.responses["open_file"] = {
+            "error": "Krita abrió un diálogo modal durante 'open_file'",
+            "modal_dialog": {"title": "Krita"},
+            "hint": "cerralo en Krita o con `kri dialog --dismiss`"}
+        r = self.kri("open", "/tmp/x.kra")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("diálogo modal", json.loads(r.stderr)["error"])
+
+    def test_read_timeout_is_not_reported_as_cannot_connect(self):
+        import time
+        FakePlugin.hooks["exec"] = lambda cmd: time.sleep(2.5)
+        r = self.kri("exec", "--timeout", "1", stdin="result = 1")
+        self.assertEqual(r.returncode, 1)
+        err = json.loads(r.stderr)
+        self.assertNotIn("Cannot connect", err["error"])
+        self.assertTrue(err.get("timeout"))
+        self.assertIn("kri dialog", err["hint"])
+
 
 if __name__ == "__main__":
     unittest.main()
