@@ -9,6 +9,13 @@ Env:
   KRITA_URL       plugin endpoint (default http://127.0.0.1:5678)
   KRITAMCP_TOKEN  shared token; must match the token set in Krita's env
   KRI_LOOK_PATH   override the default image path used by `kri look`
+  KRI_DEBUG       1 = include tracebacks when an extension fails
+
+Extensions: any subcommand that is not native is looked up as a kri
+extension (entry point group `kri.extensions`) installed in kri's own venv,
+`<data>/kri/ext-venv` (`kri ext install`). Native commands never touch it, so
+they keep the fast start. Global flags: --human (readable output instead of
+JSON) and --json (the default).
 
 Exit codes: 0 ok · 1 plugin/connection error · 2 usage error.
 """
@@ -18,6 +25,8 @@ import os
 import socket
 import sys
 import time
+
+__version__ = "0.5.0"
 
 # base64/tempfile solo los usa `look` → import lazy en write_image/look_path.
 # urllib.request costaba ~+55ms por invocación; el transporte es un socket
@@ -106,10 +115,46 @@ def send(action, params=None, timeout=30.0):
     return http_request("POST", "", body, timeout=timeout)
 
 
+HUMAN = False  # --human: readable text instead of JSON (set in main)
+
+
+def _scalar(v):
+    if v is None:
+        return "-"
+    if v is True:
+        return "sí"
+    if v is False:
+        return "no"
+    return str(v)
+
+
+def human(obj, indent=0):
+    """Readable rendering of a JSON-able result (indented `key: value`)."""
+    pad = "  " * indent
+    if isinstance(obj, dict) and obj:
+        lines = []
+        for k, v in obj.items():
+            if isinstance(v, (dict, list)) and v:
+                lines += [f"{pad}{k}:", human(v, indent + 1)]
+            else:
+                lines.append(f"{pad}{k}: {_scalar(v) if v or v in (0, False) else '-'}")
+        return "\n".join(lines)
+    if isinstance(obj, list) and obj:
+        lines = []
+        for v in obj:
+            if isinstance(v, (dict, list)) and v:
+                lines.append(f"{pad}- " + human(v, indent + 1).lstrip())
+            else:
+                lines.append(f"{pad}- {_scalar(v)}")
+        return "\n".join(lines)
+    return pad + (_scalar(obj) if not isinstance(obj, (dict, list)) else "-")
+
+
 def out(result):
-    """Print result as JSON and exit. Errors go to stderr with exit code 1 so
-    `kri a && kri b` chains stop at the first failure."""
-    text = json.dumps(result, indent=1, default=str)
+    """Print result as JSON (or --human text) and exit. Errors go to stderr
+    with exit code 1 so `kri a && kri b` chains stop at the first failure."""
+    text = (human(result) if HUMAN
+            else json.dumps(result, indent=1, default=str))
     if isinstance(result, dict) and result.get("error"):
         print(text, file=sys.stderr)
         sys.exit(1)
@@ -362,13 +407,32 @@ def daemon_health(url):
             **{k: v for k, v in res.items() if k != "status"}}
 
 
+def capability_gap(health, capability):
+    """None if a reachable daemon /health advertises `capability`, else a
+    degradation message. Daemons older than krita-autoselect api_version 2
+    have no `capabilities` at all (only /segment)."""
+    if not health.get("reachable"):
+        return None
+    caps = health.get("capabilities")
+    if caps is not None and capability in caps:
+        return None
+    version = health.get("api_version") or "<2"
+    return (f"el daemon de autoselect en {health.get('url')} no tiene "
+            f"{capability} (api_version {version}): actualizá "
+            f"krita-autoselect y reiniciá el daemon (kri sam stop && kri sam start)")
+
+
 def cmd_sam_status(a):
     plugin = send("sam_status", {"url": AUTOSELECT_URL}, timeout=10.0)
     if isinstance(plugin, dict):
         plugin.pop("status", None)
         plugin.pop("unreachable", None)
-    out({"status": "ok", "daemon": daemon_health(AUTOSELECT_URL),
-         "ai_select": plugin})
+    daemon = daemon_health(AUTOSELECT_URL)
+    result = {"status": "ok", "daemon": daemon, "ai_select": plugin}
+    gap = capability_gap(daemon, "segment_many")
+    if gap:  # kri anda igual; lo usan extensiones que segmentan por lotes
+        result["warning"] = gap
+    out(result)
 
 
 def cmd_sam_start(a):
@@ -695,12 +759,37 @@ def cmd_control_remove(a):
     out(send("ai_remove_control", clean(index=a.index, region_index=a.region)))
 
 
+# ----- Extensiones -----
+# La maquinaria vive en cli/kri_extensions.py y se importa SOLO para `kri ext`
+# o para un subcomando que no es nativo: el script principal se recompila en
+# cada invocación (no tiene .pyc), así que cada línea acá suma al arranque.
+
+NATIVE_COMMANDS = set()  # lo llena main() con los subcomandos del parser
+
+
+def extensions():
+    """El módulo de extensiones, enlazado a este kri (send, out, ...)."""
+    sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+    try:
+        import kri_extensions
+    finally:
+        sys.path.pop(0)
+    kri_extensions.K = sys.modules[__name__]
+    return kri_extensions
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="kri",
         description="CLI bridge to Krita (kritamcp plugin). Prints JSON; errors exit 1.",
     )
+    p.add_argument("--version", action="version", version=f"kri {__version__}")
+    p.add_argument("--human", action="store_true",
+                   help="readable text instead of JSON (global, any position)")
+    p.add_argument("--json", action="store_true",
+                   help="JSON output (the default; global, any position)")
     sub = p.add_subparsers(dest="cmd", required=True, metavar="command")
+    p.kri_commands = sub.choices
 
     def _place(sp, what="the layer"):
         g = sp.add_mutually_exclusive_group()
@@ -1146,11 +1235,42 @@ def build_parser():
     sp.add_argument("--region", type=int)
     sp.set_defaults(fn=cmd_control_remove)
 
+    sp = sub.add_parser("ext", add_help=False,
+                        help="extensions: list/install/enable/disable/remove/"
+                             "mcp-tools/doctor (kri ext -h)")
+    sp.add_argument("rest", nargs=argparse.REMAINDER)
+
     return p
 
 
-def main():
-    args = build_parser().parse_args()
+def global_flags(argv):
+    """Saca --human/--json de cualquier posición (antes de un `--`)."""
+    global HUMAN
+    if "--human" not in argv and "--json" not in argv:
+        return argv
+    rest, literal = [], False
+    for tok in argv:
+        if not literal and tok in ("--human", "--json"):
+            HUMAN = tok == "--human"
+            continue
+        literal = literal or tok == "--"
+        rest.append(tok)
+    return rest
+
+
+def main(argv=None):
+    argv = global_flags(sys.argv[1:] if argv is None else list(argv))
+    parser = build_parser()
+    NATIVE_COMMANDS.update(parser.kri_commands)
+    first = argv[0] if argv else None
+    if first == "ext":
+        extensions().main_ext(argv[1:])  # no vuelve
+    if first and not first.startswith("-") and first not in NATIVE_COMMANDS:
+        extensions().run_extension(first, argv[1:])  # no vuelve
+    if first in ("-h", "--help"):
+        parser.formatter_class = argparse.RawDescriptionHelpFormatter
+        parser.epilog = extensions().extensions_epilog()
+    args = parser.parse_args(argv)
     args.fn(args)
 
 

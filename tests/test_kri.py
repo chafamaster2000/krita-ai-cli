@@ -795,6 +795,29 @@ class KriTest(unittest.TestCase):
         self.assertEqual(self.last_request()["params"]["url"],
                          f"http://localhost:{self.daemon_port}")
 
+    def test_sam_status_warns_when_daemon_lacks_segment_many(self):
+        FakePlugin.responses["sam_status"] = {"status": "ok", "ai_select": True}
+        FakeDaemon.response = {"status": "ok", "service": "krita-autoselect"}
+        res = json.loads(self.kri("sam", "status").stdout)
+        self.assertIn("no tiene segment_many", res["warning"])
+        FakeDaemon.response = {"status": "ok", "api_version": 2,
+                               "capabilities": ["segment", "segment_many"]}
+        res = json.loads(self.kri("sam", "status").stdout)
+        self.assertNotIn("warning", res)
+
+    def test_human_output_and_errors(self):
+        r = self.kri("--human", "health")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("status: ok", r.stdout)
+        FakePlugin.responses["select_info"] = {"error": "No selection"}
+        r = self.kri("select", "info", "--human")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("error: No selection", r.stderr)
+
+    def test_version(self):
+        r = self.kri("--version")
+        self.assertEqual(r.stdout.strip(), "kri 0.5.0")
+
     def test_sam_status_reports_down_daemon_without_failing(self):
         FakePlugin.responses["sam_status"] = {
             "status": "ok", "ai_select": False, "detail": "not loaded"}

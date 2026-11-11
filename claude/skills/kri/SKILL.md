@@ -191,6 +191,25 @@ Generar (después de configurar):
 kri ai generate --wait && kri ai apply && kri look
 ```
 
+## Extensiones (`kri <ext> …`)
+
+Además de los nativos, kri puede tener extensiones instaladas: subcomandos que
+agregan otros paquetes (la primera es `kri autopainter`, flats automáticos de
+un lineart). `kri --help` las lista al final, y `kri <ext> --help` muestra
+sus comandos. Hablan el mismo idioma: imprimen JSON y un error sale con exit 1.
+
+- `kri ext list`: qué hay instalado y si carga (`ok`, `reason`).
+- `kri ext doctor`: qué servicios necesita cada una (daemon SAM con
+  `segment_many`, ComfyUI, CLI `claude`) y si responden.
+- Un error `extensión X rota: …` no afecta a los nativos: seguí con kri y
+  avisale al usuario (`kri ext list` dice por qué no carga).
+- Un error `no tiene segment_many` quiere decir que el daemon de
+  krita-autoselect es viejo. `kri sam status` lo muestra como `warning`.
+- `--human` devuelve texto legible en vez de JSON (para mostrarle al usuario).
+  Para trabajar, usá el JSON.
+- Instalar, deshabilitar o sacar extensiones (`kri ext install|disable|remove`)
+  cambia el entorno del usuario: hacelo sólo si te lo pide.
+
 ## Delegar a subagentes (tareas de dibujo largas)
 
 Si el dibujo pide varias rondas de iteración, no lo hagas en la sesión
