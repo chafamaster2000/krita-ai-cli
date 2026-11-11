@@ -16,6 +16,20 @@ kri tiene **extensiones** (paquetes pip en `<data>/kri/ext-venv`, entry point
 `kri.extensions`, manifiesto `kri-extension.toml`). La primera es autopainter.
 Contrato completo en README, sección "Extensiones".
 
+## Ecosistema y versiones
+
+- Este repo es **público**. Es una de tres piezas: kri (acá),
+  [krita-autoselect](https://github.com/chafamaster2000/krita-autoselect)
+  (daemon SAM 3 + plugin AI Select) y autopainter (repo **privado**, una
+  extensión de kri). En este repo no van rutas de una máquina, datos
+  personales ni nada del arte de un cliente; autopainter se menciona sólo
+  como "repo privado".
+- Rama estable: `master`. Versiones con tag anotado `vX.Y.Z` (semver), igual a
+  `__version__` de `cli/kri`. Al subir la versión hay que tocar también los
+  tests que la comparan (`tests/test_kri.py::test_version`,
+  `tests/test_ext.py::test_ctx_fields` y `test_human_flag_reaches_ctx_and_output`)
+  y sumar la entrada en `CHANGELOG.md`.
+
 ## Reglas de trabajo en este repo
 
 - El plugin corre DENTRO de Krita: cambios en `krita-plugin/` requieren

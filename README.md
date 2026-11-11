@@ -119,6 +119,19 @@ required.**
 - You can install/remove the bridge without touching your AI Diffusion install.
 - A bug in the bridge can never break normal AI Diffusion panel use.
 
+## Part of a small ecosystem
+
+kri is one of three pieces that work together. Each one stands on its own:
+
+| Repo | Role |
+|---|---|
+| **krita-ai-cli** (this repo) | `kri`: the CLI + Krita plugin (`kritamcp`) that drives Krita and AI Diffusion, plus an extension system and a versioned MCP server |
+| [krita-autoselect](https://github.com/chafamaster2000/krita-autoselect) | **AI Select**: SAM 3 segmentation daemon + Krita plugin. `kri select sam` and `kri sam` talk to it; extensions get it through `ctx.autoselect_require("segment_many")` |
+| autopainter (private) | A kri extension (`kri autopainter …`) that turns line art into per-part flat colors using a vision model + SAM 3 and exports layered `.kra`/PSD files. It is not public; the extension mechanism it uses is fully documented below and tested with a toy extension |
+
+Versions follow semver tags (`v0.5.1`, …); see [CHANGELOG.md](CHANGELOG.md).
+`kri --version` prints the current one.
+
 ---
 
 ## Setup
@@ -251,6 +264,7 @@ first failure.
 | `kri brushes` | List brush presets (filter, limit) |
 | `kri look` | **Look at the canvas.** Writes the image to a file (default `/tmp/kri-canvas.jpg`) and prints the path — the assistant Reads it. Default = small JPEG for the working loop; `--full` = full-res PNG for final review |
 | `kri save` | Export the document to a file path |
+| `kri dialog` | Show the modal dialog that is blocking Krita, if any (works even while Krita is blocked); `--dismiss` closes it |
 | `kri undo` / `kri redo` | Step the undo history |
 | `kri batch` | **Run many actions in ONE round-trip** (JSON via stdin or file), stopping at the first error; `--look fast` also returns the final canvas. Use whenever you'd otherwise chain calls (e.g. several fills to build a mask) |
 | `kri exec` | Arbitrary Python inside Krita (requires `KRITAMCP_ALLOW_EXEC=1` at Krita launch) |
@@ -485,6 +499,13 @@ plugin.
   most reliable per-region adherence. Turbo / 1-step models (Z-Image Turbo)
   effectively skip regional conditioning; Flux variants are prompt-literal and
   tend to render only the global scene when the root is strong.
+- **Modal dialogs don't hang the CLI anymore.** If a command makes Krita open a
+  modal dialog (a load warning, a missing-profile notice…), the plugin answers
+  within a second with the dialog's title and text, and every following command
+  fails fast with the same reason ("Krita está bloqueado por un diálogo modal …") until it is closed.
+  `kri open` loads files in batch mode, so Krita's load warnings never become
+  dialogs. Use `kri dialog` to see what is blocking and `kri dialog --dismiss`
+  to close it.
 - **Generation is asynchronous.** `kri ai generate` returns the moment the job
   is *queued*, not when the image is done. Use `--wait` to block until the queue
   drains (it polls `ai_status` internally), then apply.
@@ -563,8 +584,9 @@ Claude Code ──Bash──▶ kri ──HTTP :5678──▶ kritamcp (dentro d
   Si el daemon es viejo, la extensión termina con un error que dice qué
   actualizar; `kri sam status` lo muestra como `warning` y los comandos
   nativos siguen andando.
-- **autopainter** se instala con `kri ext install -e ~/Odaclick/autopainter`
-  y queda como `kri autopainter …`. Su `kri-extension.toml` declara la tool
+- **autopainter** (repo privado) se instala con
+  `kri ext install -e <checkout de autopainter>` y queda como
+  `kri autopainter …`. Su `kri-extension.toml` declara la tool
   MCP `autopainter_run`, que el server MCP registra solo.
 
 ### Dónde viven

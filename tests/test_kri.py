@@ -816,7 +816,7 @@ class KriTest(unittest.TestCase):
 
     def test_version(self):
         r = self.kri("--version")
-        self.assertEqual(r.stdout.strip(), "kri 0.5.0")
+        self.assertEqual(r.stdout.strip(), "kri 0.5.1")
 
     def test_sam_status_reports_down_daemon_without_failing(self):
         FakePlugin.responses["sam_status"] = {

@@ -208,7 +208,7 @@ class InstalledToyTest(ExtBase):
 
     def test_ctx_fields(self):
         res = self.kri_json("toy", "info")
-        self.assertEqual(res["version"], "0.5.0")
+        self.assertEqual(res["version"], "0.5.1")
         self.assertIs(res["json"], True)
         self.assertEqual(res["name"], "toy")
         self.assertEqual(res["krita_url"], self.env["KRITA_URL"])
@@ -218,7 +218,7 @@ class InstalledToyTest(ExtBase):
     def test_human_flag_reaches_ctx_and_output(self):
         r = self.kri("toy", "info", "--human")
         self.assertIn("json: no", r.stdout)
-        self.assertIn("version: 0.5.0", r.stdout)
+        self.assertIn("version: 0.5.1", r.stdout)
 
     def test_ctx_send_talks_to_the_plugin(self):
         res = self.kri_json("toy", "ping")

@@ -26,7 +26,7 @@ import socket
 import sys
 import time
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 # base64/tempfile solo los usa `look` → import lazy en write_image/look_path.
 # urllib.request costaba ~+55ms por invocación; el transporte es un socket
