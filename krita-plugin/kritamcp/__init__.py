@@ -39,7 +39,9 @@ from urllib.parse import urlparse, parse_qs
 import os
 
 # Configuration - customize these as needed
-SERVER_PORT = 5678
+# KRITAMCP_PORT: a second Krita (tests, another profile) can serve on its
+# own port; point kri at it with KRITA_URL.
+SERVER_PORT = int(os.environ.get("KRITAMCP_PORT", "5678"))
 CANVAS_OUTPUT_DIR = os.path.expanduser("~/krita-mcp-output")
 # Optional shared-token auth: if set (same value as the MCP server's
 # KRITAMCP_TOKEN), every request must carry it in the X-Kritamcp-Token header.

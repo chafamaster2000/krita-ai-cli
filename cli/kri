@@ -592,6 +592,280 @@ def cmd_colorspace(a):
                                      profile=a.profile), timeout=120.0))
 
 
+# ----- auto-flats (krita-autoselect daemon: POST /flats) -----
+
+FLATS_TIMEOUT = 900.0
+CHARACTER_EXTS = (".yaml", ".yml", ".json")
+
+
+def flats_library():
+    """Character library shared with AI Select and `python -m autoflats`."""
+    if os.environ.get("AUTOSELECT_FLATS_DIR"):
+        return os.environ["AUTOSELECT_FLATS_DIR"]
+    home = os.path.expanduser("~")
+    if sys.platform.startswith("win"):
+        base = os.environ.get("LOCALAPPDATA") or os.path.join(
+            home, "AppData", "Local")
+    elif sys.platform == "darwin":
+        base = os.path.join(home, "Library", "Application Support")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or os.path.join(
+            home, ".local", "share")
+    return os.path.join(base, "krita-autoselect", "flats", "characters")
+
+
+def flats_character_path(ref):
+    """A character: a file path, or a name in the library. None = default."""
+    if not ref or ref == "default":
+        return None
+    if os.path.isfile(ref):
+        return os.path.abspath(ref)
+    for ext in ("",) + CHARACTER_EXTS:
+        cand = os.path.join(flats_library(), ref + ext)
+        if os.path.isfile(cand):
+            return cand
+    print(f"kri: character '{ref}' not found (file or name in "
+          f"{flats_library()}; `kri flats characters` lists them)",
+          file=sys.stderr)
+    sys.exit(2)
+
+
+def flats_texts(a, image_path=None):
+    """Config texts for /flats, applied in order: character file, the
+    drawing's own <stem>.flats.yaml (if any), then --config files."""
+    files = []
+    char = flats_character_path(a.character)
+    if char:
+        files.append(char)
+    if image_path:
+        stem = os.path.splitext(image_path)[0]
+        for ext in (".flats.yaml", ".flats.yml", ".flats.json"):
+            if os.path.isfile(stem + ext):
+                files.append(stem + ext)
+                break
+    files += [os.path.abspath(f) for f in (a.config or [])]
+    texts = []
+    for f in files:
+        with open(f, encoding="utf-8") as fh:
+            texts.append(fh.read())
+    if texts and not char:
+        # overrides alone sit on the default taxonomy
+        texts.insert(0, "extends: default\n")
+    return texts, files
+
+
+def flats_request(image_b64, texts, name, outputs, timeout=FLATS_TIMEOUT):
+    global AUTOSELECT_URL
+    body = json.dumps(clean(image_b64=image_b64, name=name, outputs=outputs,
+                            config_text=texts or None)).encode()
+    hint = ("is the krita-autoselect daemon running? AI Select in Krita "
+            "starts it, or `kri sam start`")
+    res = http_request("POST", "/flats", body, timeout=timeout,
+                       url=AUTOSELECT_URL, hint=hint)
+    if isinstance(res, dict) and res.get("unreachable"):
+        url, err = sam_ensure()
+        if url:
+            AUTOSELECT_URL = url
+            res = http_request("POST", "/flats", body, timeout=timeout,
+                               url=AUTOSELECT_URL, hint=hint)
+        else:
+            res["error"] += f" [auto-start via AI Select failed: {err}]"
+    if not isinstance(res, dict) or res.get("error"):
+        out(res if isinstance(res, dict) else {"error": "bad response"})
+    return res
+
+
+def flats_brief(res, paths):
+    """Compact result: what an assistant needs to decide the next step."""
+    rep = res.get("report") or {}
+    return {
+        "image": rep.get("image"),
+        "verdict": rep.get("verdict"),
+        "config": (rep.get("config") or {}).get("name"),
+        "layers": [f"{l['name']} {l['pixels']}px"
+                   for l in rep.get("layers", [])],
+        "empty_parts": rep.get("empty_parts"),
+        "warnings": [c["message"] for c in rep.get("checks", [])
+                     if c.get("level") == "warn"],
+        "notes": [c["message"] for c in rep.get("checks", [])
+                  if c.get("level") != "warn"][:15],
+        "timings": rep.get("timings"),
+        "files": paths,
+    }
+
+
+def _b64_to(path, b64):
+    import base64
+    with open(path, "wb") as f:
+        f.write(base64.b64decode(b64))
+    return path
+
+
+def cmd_flats_run(a):
+    import base64
+    images = []
+    for p in a.images:
+        if os.path.isdir(p):
+            images += [os.path.join(p, f) for f in sorted(os.listdir(p))
+                       if f.lower().endswith((".png", ".jpg", ".jpeg",
+                                              ".webp"))
+                       and not f.endswith(("_preview.png", "_overlay.png"))]
+        else:
+            images.append(p)
+    results = []
+    for img in images:
+        if not os.path.isfile(img):
+            out({"error": f"not found: {img}"})
+        texts, files = flats_texts(a, img)
+        stem = os.path.splitext(os.path.basename(img))[0]
+        outdir = os.path.abspath(a.out or os.path.join(
+            os.path.dirname(os.path.abspath(img)), "flats"))
+        os.makedirs(outdir, exist_ok=True)
+        with open(img, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+        outputs = ["kra", "preview", "overlay", "report"] + (
+            ["ora"] if a.ora else [])
+        res = flats_request(b64, texts, stem, outputs)
+        paths = {"kra": _b64_to(os.path.join(outdir, stem + ".kra"),
+                                res["kra_b64"]),
+                 "preview": _b64_to(os.path.join(outdir, stem + "_preview.png"),
+                                    res["preview_png_b64"]),
+                 "overlay": _b64_to(os.path.join(outdir, stem + "_overlay.png"),
+                                    res["overlay_png_b64"])}
+        if a.ora:
+            paths["ora"] = _b64_to(os.path.join(outdir, stem + ".ora"),
+                                   res["ora_b64"])
+        paths["report"] = os.path.join(outdir, stem + "_report.json")
+        with open(paths["report"], "w", encoding="utf-8") as f:
+            json.dump(res.get("report"), f, indent=1, ensure_ascii=False)
+        brief = flats_brief(res, paths)
+        brief["config_files"] = files
+        results.append(brief)
+    out({"status": "ok", "drawings": results} if len(results) != 1
+        else {"status": "ok", **results[0]})
+
+
+def _find_node(tree, pred):
+    for n in tree:
+        if pred(n):
+            return n
+        hit = _find_node(n.get("children") or [], pred)
+        if hit:
+            return hit
+    return None
+
+
+def cmd_flats_doc(a):
+    """Auto-flat the active layer (the line art) of the open document and
+    build the layers in Krita: group with one layer + selection mask per
+    part below the line art; line art on top in Multiply, locked."""
+    import base64
+    import tempfile
+    tree = send("layer_list")
+    if not isinstance(tree, dict) or tree.get("error"):
+        out(tree)
+    active = tree.get("active")
+    line = _find_node(tree.get("layers") or [],
+                      lambda n: n.get("path") == active)
+    if not line or line.get("type") != "paintlayer":
+        out({"error": "select the line art layer (a paint layer) in Krita "
+                      "first", "active": active})
+    doc = tree.get("document") or {}
+    work = os.path.join(tempfile.gettempdir(), "kri-flats",
+                        str(int(time.time())))
+    os.makedirs(work, exist_ok=True)
+    if (doc.get("color_model"), doc.get("color_depth")) != ("RGBA", "U8"):
+        res = send("doc_colorspace", {"model": "RGBA", "depth": "U8"},
+                   timeout=120.0)
+        if not isinstance(res, dict) or res.get("error"):
+            out(res)
+    src = os.path.join(work, "lineart.png")
+    res = send("layer_export", {"ref": line["id"], "path": src},
+               timeout=120.0)
+    if not isinstance(res, dict) or res.get("error"):
+        out(res)
+    texts, files = flats_texts(a)
+    with open(src, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode()
+    name = os.path.splitext(os.path.basename(doc.get("name") or "drawing"))[0]
+    res = flats_request(b64, texts, name, ["parts", "report", "overlay"])
+    paths = {"overlay": _b64_to(os.path.join(work, "overlay.png"),
+                                res["overlay_png_b64"]),
+             "report": os.path.join(work, "report.json")}
+    with open(paths["report"], "w", encoding="utf-8") as f:
+        json.dump(res.get("report"), f, indent=1, ensure_ascii=False)
+    brief = flats_brief(res, paths)
+    brief["config_files"] = files
+    if a.no_apply:
+        out({"status": "ok", "applied": False, **brief})
+    group_name = res.get("group_name") or "Flats"
+    parent_path = line["path"].rsplit("/", 1)[0] if "/" in line["path"] \
+        else ""
+    old = _find_node(tree.get("layers") or [], lambda n: n.get("type") ==
+                     "grouplayer" and n.get("name") == group_name and
+                     n.get("path") == (parent_path + "/" if parent_path
+                                       else "") + group_name)
+    if old:
+        res_del = send("layer_delete", {"refs": [old["id"]]})
+        if not isinstance(res_del, dict) or res_del.get("error"):
+            out(res_del)
+    grp = send("layer_new", {"name": group_name, "type": "group",
+                             "above": line["id"]})
+    if not isinstance(grp, dict) or grp.get("error"):
+        out(grp)
+    gpath = grp["layer"]["path"]
+    cmds = []
+    for part in reversed(res.get("parts") or []):   # bottom first
+        png = _b64_to(os.path.join(work, f"part_{part['index']:02d}.png"),
+                      part["png_b64"])
+        ref = f"{gpath}/{part['name']}"
+        cmds += [
+            {"action": "layer_import", "params": {
+                "path": png, "name": part["name"], "x": part["x"],
+                "y": part["y"], "into": grp["layer"]["id"]}},
+            {"action": "select_from_layer", "params": {"ref": ref}},
+            {"action": "select_save", "params": {
+                "name": "Sel " + part["name"], "on": ref}},
+        ]
+    cmds += [{"action": "select_none", "params": {}},
+             {"action": "layer_set", "params": {
+                 "ref": line["id"], "blend": "multiply", "locked": True}},
+             {"action": "layer_move", "params": {"ref": line["id"],
+                                                 "top": True}}]
+    batch = send("batch", {"commands": cmds, "stop_on_error": True},
+                 timeout=600.0)
+    if not isinstance(batch, dict) or batch.get("error") or \
+            batch.get("stopped_at") is not None:
+        out({"error": "building the layers failed", "batch": batch})
+    out({"status": "ok", "applied": True, "group": gpath, **brief})
+
+
+def cmd_flats_characters(a):
+    lib = flats_library()
+    names = []
+    if os.path.isdir(lib):
+        names = sorted(f for f in os.listdir(lib)
+                       if f.lower().endswith(CHARACTER_EXTS))
+    out({"status": "ok", "library": lib,
+         "characters": [{"name": os.path.splitext(n)[0],
+                         "path": os.path.join(lib, n)} for n in names]})
+
+
+def cmd_flats_new(a):
+    lib = flats_library()
+    os.makedirs(lib, exist_ok=True)
+    path = os.path.join(lib, a.name + ".yaml")
+    if os.path.exists(path):
+        out({"error": f"already exists: {path}", "path": path})
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"# Auto-flats character. Say once what {a.name} wears.\n"
+                f"name: {a.name}\nextends: default\n"
+                "# remove: [Falda, Vestido, Capa, Armadura]\n"
+                "# parts:\n#   Guantes: {instances: best}\n"
+                "# palette:\n#   Piel: \"#F2C29B\"\n")
+    out({"status": "ok", "path": path})
+
+
 # ----- AI Diffusion -----
 
 def cmd_ai_status(a):
@@ -1145,6 +1419,36 @@ def build_parser():
     sp.add_argument("index", type=int)
     sp.add_argument("--region", type=int)
     sp.set_defaults(fn=cmd_control_remove)
+
+    fl = sub.add_parser(
+        "flats", help="auto-flats: one flat-colour layer per part (SAM 3 + "
+        "line art), via the krita-autoselect daemon"
+    ).add_subparsers(dest="flats_cmd", required=True, metavar="flats-command")
+    def char_opts(sp):
+        sp.add_argument("-c", "--character",
+                        help="character name (library) or file; default: "
+                        "the built-in taxonomy")
+        sp.add_argument("--config", action="append",
+                        help="extra config file on top (repeatable)")
+    sp = fl.add_parser("run", help="image files/folders -> .kra + previews + "
+                       "report, no Krita needed")
+    sp.add_argument("images", nargs="+")
+    char_opts(sp)
+    sp.add_argument("-o", "--out", help="output folder (default: "
+                    "<image folder>/flats)")
+    sp.add_argument("--ora", action="store_true", help="also write .ora")
+    sp.set_defaults(fn=cmd_flats_run)
+    sp = fl.add_parser("doc", help="auto-flat the open document: the active "
+                       "layer is the line art")
+    char_opts(sp)
+    sp.add_argument("--no-apply", action="store_true",
+                    help="only compute and report, don't touch the document")
+    sp.set_defaults(fn=cmd_flats_doc)
+    sp = fl.add_parser("characters", help="list the character library")
+    sp.set_defaults(fn=cmd_flats_characters)
+    sp = fl.add_parser("new", help="create a character file in the library")
+    sp.add_argument("name")
+    sp.set_defaults(fn=cmd_flats_new)
 
     return p
 
