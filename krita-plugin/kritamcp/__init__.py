@@ -4,28 +4,123 @@ Allows Claude (or any MCP client) to paint by sending commands to this plugin.
 """
 
 from krita import *
-from PyQt5.QtCore import (
-    QTimer, QThread, pyqtSignal, QObject, Qt, QPointF, QRectF, QUuid,
-    QByteArray, QBuffer, QIODevice,
-)
-from PyQt5.QtGui import (
-    QColor, QImage, QPainter, QPen, QBrush, QPainterPath,
-)
-from PyQt5.QtWidgets import QMessageBox, QApplication
+
+# Krita 6 ships PyQt6 (Qt6), Krita 5 ships PyQt5 (Qt5). Krita's own `krita`
+# module blocks importing the *other* binding (ModuleNotFoundError), so trying
+# PyQt6 first and falling back to PyQt5 always picks the right one — the same
+# pattern Krita 6's bundled plugins use. Everything below sticks to APIs that
+# exist in both: fully-scoped enums (Qt.PenStyle.NoPen, QImage.Format.Format_X,
+# ...), which PyQt5 5.11+ also accepts, and no exec_().
+try:
+    from PyQt6.QtCore import (
+        QTimer, QThread, pyqtSignal, QObject, Qt, QPointF, QRectF, QUuid,
+        QByteArray, QBuffer, QIODevice,
+    )
+    from PyQt6.QtGui import (
+        QColor, QImage, QPainter, QPen, QBrush, QPainterPath,
+    )
+    from PyQt6.QtWidgets import QMessageBox, QApplication
+except ImportError:
+    from PyQt5.QtCore import (
+        QTimer, QThread, pyqtSignal, QObject, Qt, QPointF, QRectF, QUuid,
+        QByteArray, QBuffer, QIODevice,
+    )
+    from PyQt5.QtGui import (
+        QColor, QImage, QPainter, QPen, QBrush, QPainterPath,
+    )
+    from PyQt5.QtWidgets import QMessageBox, QApplication
 import base64
+import difflib
 import json
+import sys
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 import os
 
 # Configuration - customize these as needed
-SERVER_PORT = 5678
+# KRITAMCP_PORT: a second Krita (tests, another profile) can serve on its
+# own port; point kri at it with KRITA_URL.
+SERVER_PORT = int(os.environ.get("KRITAMCP_PORT", "5678"))
 CANVAS_OUTPUT_DIR = os.path.expanduser("~/krita-mcp-output")
 # Optional shared-token auth: if set (same value as the MCP server's
 # KRITAMCP_TOKEN), every request must carry it in the X-Kritamcp-Token header.
 # Empty = no token check (still safe for local use thanks to the Origin guard).
 AUTH_TOKEN = os.environ.get("KRITAMCP_TOKEN", "")
+
+# Blending modes (composite op ids) by category, as registered by Krita's
+# KoCompositeOpRegistry (5.3 / 6.0). libkis' Node.setBlendingMode does NOT
+# validate: an unknown id silently renders as "normal", so we check here.
+BLEND_MODES = {
+    "mix": ["normal", "behind", "greater", "overlay", "lambert_lighting",
+            "lambert_lighting_gamma2.2", "erase", "alphadarken", "marker",
+            "hard mix", "hard_mix_hdr", "hard_mix_photoshop",
+            "hard_mix_softer_photoshop", "grain_merge", "grain_extract",
+            "parallel", "allanon", "geometric_mean", "destination-atop",
+            "destination-in", "hard overlay", "hard_overlay_hdr",
+            "interpolation", "interpolation 2x", "penumbra a", "penumbra b",
+            "penumbra c", "penumbra d"],
+    "arithmetic": ["add", "subtract", "multiply", "divide", "inverse_subtract"],
+    "dark": ["burn", "linear_burn", "darken", "gamma_dark", "darker color",
+             "shade_ifs_illusions", "fog_darken_ifs_illusions", "easy burn"],
+    "light": ["dodge", "dodge_hdr", "linear_dodge", "lighten", "linear light",
+              "screen", "pin_light", "vivid_light", "vivid_light_hdr",
+              "flat_light", "hard_light", "soft_light_ifs_illusions",
+              "soft_light_pegtop_delphi", "soft_light", "soft_light_svg",
+              "gamma_light", "gamma_illumination", "lighter color", "pnorm_a",
+              "pnorm_b", "super_light", "tint_ifs_illusions",
+              "fog_lighten_ifs_illusions", "easy dodge", "luminosity_sai"],
+    "negative": ["diff", "equivalence", "additive_subtractive", "exclusion",
+                 "arc_tangent", "negation"],
+    "binary": ["xor", "or", "and", "nand", "nor", "xnor", "implication",
+               "not_implication", "converse", "not_converse"],
+    "modulo": ["modulo", "modulo_continuous", "divisive_modulo",
+               "divisive_modulo_continuous", "modulo_shift",
+               "modulo_shift_continuous"],
+    "hsy": ["color", "hue", "tint", "saturation", "luminize", "dec_saturation",
+            "inc_saturation", "dec_luminosity", "inc_luminosity"],
+    "hsi": ["color_hsi", "hue_hsi", "saturation_hsi", "intensity",
+            "dec_saturation_hsi", "inc_saturation_hsi", "dec_intensity",
+            "inc_intensity"],
+    "hsl": ["color_hsl", "hue_hsl", "saturation_hsl", "lightness",
+            "dec_saturation_hsl", "inc_saturation_hsl", "dec_lightness",
+            "inc_lightness"],
+    "hsv": ["color_hsv", "hue_hsv", "saturation_hsv", "value",
+            "dec_saturation_hsv", "inc_saturation_hsv", "dec_value",
+            "inc_value"],
+    "quadratic": ["reflect", "glow", "freeze", "heat", "glow_heat",
+                  "heat_glow", "reflect_freeze", "freeze_reflect",
+                  "heat_glow_freeze_reflect_hybrid"],
+    "misc": ["bumpmap", "combine_normal", "dissolve", "copy_red",
+             "copy_green", "copy_blue", "copy", "tangent_normalmap"],
+}
+BLEND_IDS = {m for modes in BLEND_MODES.values() for m in modes}
+# Friendly names (Photoshop / CSS style) -> Krita id. Keys are normalized:
+# lowercase, with "-" for any run of spaces/underscores/hyphens.
+BLEND_ALIASES = {
+    "over": "normal",
+    "soft-light": "soft_light",
+    "hard-light": "hard_light",
+    "color-burn": "burn",
+    "color-dodge": "dodge",
+    "linear-burn": "linear_burn",
+    "linear-dodge": "linear_dodge",
+    "linear-light": "linear light",
+    "vivid-light": "vivid_light",
+    "pin-light": "pin_light",
+    "hard-mix": "hard mix",
+    "difference": "diff",
+    "addition": "add",
+    "plus": "add",
+    "luminosity": "luminize",
+    "darker-color": "darker color",
+    "lighter-color": "lighter color",
+    "grain-merge": "grain_merge",
+    "grain-extract": "grain_extract",
+}
+PLACEMENT_KEYS = ("above", "below", "into", "top", "bottom")
+# Perfil de la capa RGBA8 intermedia: PNG/JPG y colores hex son sRGB.
+SRGB_PROFILE = "sRGB-elle-V2-srgbtrc.icc"
 
 class CommandQueue:
     """Thread-safe command queue for passing commands from HTTP thread to main thread.
@@ -233,6 +328,10 @@ class KritaMCPExtension(Extension):
         self.current_brush_size = 20
         self.current_opacity = 1.0
         self._suppress_refresh = False
+        # `kri sam start`: resultado del último ensure del daemon de AI Select
+        # (lo escribe un hilo del manager; kri lo lee con sam_status).
+        self._sam_start = None
+        self._sam_seq = 0
 
     def setup(self):
         """Called when extension is loaded."""
@@ -261,7 +360,7 @@ class KritaMCPExtension(Extension):
         global dispatcher
         if dispatcher is None:
             dispatcher = CommandDispatcher()
-            dispatcher.pushed.connect(self.process_commands, Qt.QueuedConnection)
+            dispatcher.pushed.connect(self.process_commands, Qt.ConnectionType.QueuedConnection)
 
         # Low-frequency fallback timer in case a signal is ever missed (e.g.
         # a command queued before the dispatcher was wired up). Not the hot path.
@@ -446,7 +545,7 @@ class KritaMCPExtension(Extension):
         the heavy lifting happens in Qt's C++ painter — no per-pixel Python.
 
         bbox is (x, y, w, h) already clamped to the canvas. Krita's U8 RGBA pixel
-        order is BGRA in memory, which is exactly QImage.Format_ARGB32 on
+        order is BGRA in memory, which is exactly QImage.Format.Format_ARGB32 on
         little-endian, so the byte buffers map without conversion.
         """
         x, y, w, h = bbox
@@ -454,12 +553,12 @@ class KritaMCPExtension(Extension):
             return False
 
         existing = bytes(layer.pixelData(x, y, w, h))
-        base = QImage(existing, w, h, QImage.Format_ARGB32).copy()
+        base = QImage(existing, w, h, QImage.Format.Format_ARGB32).copy()
 
-        overlay = QImage(w, h, QImage.Format_ARGB32)
+        overlay = QImage(w, h, QImage.Format.Format_ARGB32)
         overlay.fill(0)  # fully transparent
         painter = QPainter(overlay)
-        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         draw_fn(painter)
         painter.end()
 
@@ -470,11 +569,11 @@ class KritaMCPExtension(Extension):
             sw = max(1, w // (f + 1))
             sh = max(1, h // (f + 1))
             overlay = (overlay
-                       .scaled(sw, sh, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-                       .scaled(w, h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation))
+                       .scaled(sw, sh, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                       .scaled(w, h, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation))
 
         comp = QPainter(base)
-        comp.setCompositionMode(QPainter.CompositionMode_SourceOver)
+        comp.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
         comp.drawImage(0, 0, overlay)
         comp.end()
 
@@ -489,7 +588,7 @@ class KritaMCPExtension(Extension):
         pointer array is ~512 MB for a 4K canvas. QImage.fill writes ARGB32,
         which is BGRA in memory on little-endian — exactly Krita's U8 RGBA order.
         """
-        img = QImage(w, h, QImage.Format_ARGB32)
+        img = QImage(w, h, QImage.Format.Format_ARGB32)
         img.fill(qcolor)
         layer.setPixelData(img.constBits().asstring(w * h * 4), 0, 0, w, h)
 
@@ -536,8 +635,8 @@ class KritaMCPExtension(Extension):
 
         def draw(painter):
             pen = QPen(pen_color, brush_size)
-            pen.setCapStyle(Qt.RoundCap)
-            pen.setJoinStyle(Qt.RoundJoin)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
             painter.setPen(pen)
             painter.drawPath(path)
 
@@ -577,7 +676,7 @@ class KritaMCPExtension(Extension):
             return {"error": "Fill area out of bounds"}
 
         def draw(painter):
-            painter.setPen(Qt.NoPen)
+            painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QBrush(qcolor))
             painter.drawEllipse(QPointF(x - x1, y - y1), radius, radius)
 
@@ -626,7 +725,7 @@ class KritaMCPExtension(Extension):
 
             def draw(painter):
                 pen = QPen(qcolor, line_width)
-                pen.setCapStyle(Qt.RoundCap)
+                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
                 painter.setPen(pen)
                 painter.drawLine(QPointF(x - x1b, y - y1b), QPointF(x2 - x1b, y2 - y1b))
 
@@ -649,11 +748,11 @@ class KritaMCPExtension(Extension):
                 if fill:
                     painter.setBrush(QBrush(qcolor))
                 else:
-                    painter.setBrush(Qt.NoBrush)
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
                 if stroke or not fill:
                     painter.setPen(QPen(qcolor, int(params.get("line_width", 2))))
                 else:
-                    painter.setPen(Qt.NoPen)
+                    painter.setPen(Qt.PenStyle.NoPen)
                 if shape == "rectangle":
                     painter.drawRect(rect)
                 else:
@@ -704,7 +803,7 @@ class KritaMCPExtension(Extension):
 
         ba = QByteArray()
         buf = QBuffer(ba)
-        buf.open(QIODevice.WriteOnly)
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
         if quality >= 0:
             img.save(buf, fmt, quality)
         else:
@@ -788,17 +887,15 @@ class KritaMCPExtension(Extension):
         if not doc:
             return {"error": "No active document"}
 
-        # Get projection pixel data at point
-        layer = doc.rootNode()
-        pixel_data = layer.projectionPixelData(x, y, 1, 1)
-
-        if len(pixel_data) >= 4:
-            # Krita U8 "RGBA" is laid out BGRA in memory (little-endian ARGB32).
-            b, g, r, a = pixel_data[0], pixel_data[1], pixel_data[2], pixel_data[3]
-            hex_color = "#{:02x}{:02x}{:02x}".format(r, g, b)
-            return {"status": "ok", "color": hex_color, "r": r, "g": g, "b": b, "a": a}
-
-        return {"error": "Could not read pixel"}
+        # Document.projection() hands back an sRGB QImage whatever the image
+        # colour space (GRAYA / 16-bit / float), unlike raw pixel bytes.
+        img = doc.projection(int(x), int(y), 1, 1)
+        if img is None or img.isNull():
+            return {"error": "Could not read pixel"}
+        c = img.pixelColor(0, 0)
+        r, g, b, a = c.red(), c.green(), c.blue(), c.alpha()
+        hex_color = "#{:02x}{:02x}{:02x}".format(r, g, b)
+        return {"status": "ok", "color": hex_color, "r": r, "g": g, "b": b, "a": a}
 
     def cmd_list_brushes(self, params):
         """List available brush presets."""
@@ -976,11 +1073,11 @@ class KritaMCPExtension(Extension):
     def _mask_image(self, doc, draw_fn):
         """Canvas-sized Grayscale8 mask painted by draw_fn (antialiased)."""
         w, h = doc.width(), doc.height()
-        img = QImage(w, h, QImage.Format_Grayscale8)
+        img = QImage(w, h, QImage.Format.Format_Grayscale8)
         img.fill(0)
         painter = QPainter(img)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        painter.setPen(Qt.NoPen)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(QColor(255, 255, 255)))
         draw_fn(painter)
         painter.end()
@@ -1015,6 +1112,10 @@ class KritaMCPExtension(Extension):
         tmp = doc.createNode("__kri_select_tmp", "paintlayer")
         doc.rootNode().addChildNode(tmp, None)
         try:
+            # The bytes are RGBA8; on a GRAYA / 16-bit / float document the
+            # temp layer must be RGBA8 too or they land as garbage.
+            if not self._is_rgba8(tmp):
+                tmp.setColorSpace("RGBA", "U8", self._profile_for("RGBA", "U8"))
             tmp.setPixelData(bytes(argb), 0, 0, w, h)
             doc.setActiveNode(tmp)
             doc.waitForDone()
@@ -1041,7 +1142,7 @@ class KritaMCPExtension(Extension):
             return
         w, h = doc.width(), doc.height()
         data = bytes(sel.pixelData(0, 0, w, h))
-        img = QImage(data, w, h, w, QImage.Format_Grayscale8).copy()
+        img = QImage(data, w, h, w, QImage.Format.Format_Grayscale8).copy()
         self._select_via_layer(doc, img, "replace")
 
     def cmd_select_shape(self, params):
@@ -1171,12 +1272,962 @@ class KritaMCPExtension(Extension):
             return {"error": "Could not decode mask image"}
         w, h = doc.width(), doc.height()
         if img.width() != w or img.height() != h:
-            img = img.scaled(w, h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-        img = img.convertToFormat(QImage.Format_Grayscale8)
+            img = img.scaled(w, h, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        img = img.convertToFormat(QImage.Format.Format_Grayscale8)
         err = self._select_via_layer(doc, img, mode)
         if err:
             return err
         return {"status": "ok", "mode": mode, **self._selection_bounds(doc)}
+
+    # ----- Layers -----
+    # A layer reference ("ref") is a uniqueId (braces optional), a
+    # "Group/Sub/Layer" path from the top level, or a unique layer name.
+    # Opacity travels as a percentage (0-100) in both directions.
+
+    @staticmethod
+    def _node_id(node):
+        return node.uniqueId().toString().strip("{}").lower()
+
+    def _same(self, a, b):
+        return (a is not None and b is not None
+                and self._node_id(a) == self._node_id(b))
+
+    @staticmethod
+    def _children(parent):
+        """childNodes() minus Krita's global selection mask: while a global
+        selection exists, the root holds a hidden "Selection Mask" node that
+        the Layers docker does not show and nothing here should touch."""
+        kids = parent.childNodes()
+        if parent.parentNode() is None:
+            kids = [k for k in kids if k.type() != "selectionmask"]
+        return kids
+
+    def _walk(self, parent, prefix="", depth=0):
+        """(node, path, depth) for every node under parent, top-to-bottom
+        (the Layers docker order; childNodes() is bottom-to-top)."""
+        for child in reversed(self._children(parent)):
+            path = f"{prefix}/{child.name()}" if prefix else child.name()
+            yield child, path, depth
+            yield from self._walk(child, path, depth + 1)
+
+    def _path(self, node):
+        names = []
+        while node is not None:
+            parent = node.parentNode()
+            if parent is None:  # root
+                break
+            names.append(node.name())
+            node = parent
+        return "/".join(reversed(names))
+
+    def _resolve(self, doc, ref, types=None, what="layer"):
+        """(node, None) or (None, error_dict). `types` restricts node.type()."""
+        if ref is None or str(ref).strip() == "":
+            return None, {"error": f"A {what} reference is required"}
+        ref = str(ref)
+        entries = [e for e in self._walk(doc.rootNode())
+                   if types is None or e[0].type() in types]
+        key = ref.strip().strip("{}").lower()
+        for node, path, _ in entries:
+            if self._node_id(node) == key:
+                return node, None
+        # A path only when it has a "/" (a leading "/" pins a top-level
+        # layer): a bare name must report ambiguity across all groups.
+        matchers = [lambda p, n: p == ref.strip("/")] if "/" in ref else []
+        matchers += [lambda p, n: n.name() == ref,
+                     lambda p, n: n.name().lower() == ref.lower()]
+        for matcher in matchers:
+            hits = [(n, p) for n, p, _ in entries if matcher(p, n)]
+            if len(hits) == 1:
+                return hits[0][0], None
+            if len(hits) > 1:
+                cands = [{"path": p, "id": self._node_id(n), "type": n.type()}
+                         for n, p in hits]
+                return None, {
+                    "error": (f"Ambiguous {what} '{ref}': {len(hits)} match "
+                              f"({', '.join(c['path'] for c in cands)}). "
+                              f"Use a Group/Layer path or the id."),
+                    "candidates": cands}
+        names = sorted({p for _, p, _ in entries} | {n.name() for n, _, _ in entries})
+        close = difflib.get_close_matches(ref, names, n=5, cutoff=0.5)
+        err = {"error": f"{what.capitalize()} not found: '{ref}'"
+               + (f". Did you mean: {', '.join(close)}?" if close else "")}
+        return None, err
+
+    def _layer_info(self, doc, node, path=None, active_id=None, bounds=True):
+        """bounds: True = exact content bounds (scans freshly written pixels:
+        ~0.4 s on a full-size layer), a known (x, y, w, h), or False to omit."""
+        if active_id is None:
+            active = doc.activeNode()
+            active_id = self._node_id(active) if active is not None else ""
+        r = self._bounds(node) if bounds is True else bounds
+        info = {
+            "name": node.name(),
+            "path": path if path is not None else self._path(node),
+            "type": node.type(),
+            "id": self._node_id(node),
+            "blend": node.blendingMode(),
+            "opacity": round(node.opacity() * 100 / 255),
+            "visible": node.visible(),
+            "locked": node.locked(),
+            "alpha_locked": node.alphaLocked(),
+            "inherit_alpha": node.inheritAlpha(),
+            "active": self._node_id(node) == active_id,
+        }
+        if bounds is not False:
+            info["bounds"] = (None if r is None else
+                              {"x": r[0], "y": r[1], "width": r[2], "height": r[3]})
+        return info
+
+    @staticmethod
+    def _bounds(node):
+        """(x, y, w, h) of the node's content, None if empty. A selection
+        mask's own bounds are its tile-aligned extent: use the selection's."""
+        if node.type() == "selectionmask":
+            sel = node.selection()
+            if sel is None or sel.width() <= 0 or sel.height() <= 0:
+                return None
+            return sel.x(), sel.y(), sel.width(), sel.height()
+        r = node.bounds()
+        if r.isEmpty():
+            return None
+        return r.x(), r.y(), r.width(), r.height()
+
+    def _blend_id(self, mode):
+        """(krita_id, None) or (None, error_dict). Accepts Krita ids, ids
+        written with -/_/space variations and friendly aliases."""
+        s = str(mode).strip().lower()
+        variants = [s, s.replace("-", "_"), s.replace("-", " "),
+                    s.replace("_", " "), s.replace(" ", "_")]
+        for v in variants:
+            if v in BLEND_IDS:
+                return v, None
+        norm = "-".join(t for t in s.replace("_", " ").replace("-", " ").split())
+        if norm in BLEND_ALIASES:
+            return BLEND_ALIASES[norm], None
+        close = difflib.get_close_matches(
+            s, sorted(BLEND_IDS | set(BLEND_ALIASES)), n=5, cutoff=0.5)
+        return None, {
+            "error": (f"Unknown blending mode '{mode}'"
+                      + (f". Did you mean: {', '.join(close)}?" if close else "")
+                      + " (`kri layer blends` lists them all)"),
+            "suggestions": close}
+
+    def _placement(self, doc, params):
+        """Where to put a node: (spec, None) / (None, error) / (None, None)
+        when no placement was given. spec = (parent, where, ref) with where
+        in top/bottom/above/below."""
+        given = [k for k in PLACEMENT_KEYS if params.get(k) not in (None, False, "")]
+        if not given:
+            return None, None
+        if len(given) > 1:
+            return None, {"error": f"Use only one placement, got {given}"}
+        key = given[0]
+        root = doc.rootNode()
+        if key in ("top", "bottom"):
+            return (root, key, None), None
+        ref_node, err = self._resolve(doc, params[key])
+        if err:
+            return None, err
+        if key == "into":
+            if ref_node.type() != "grouplayer":
+                return None, {"error": f"--into needs a group layer, "
+                                       f"'{ref_node.name()}' is {ref_node.type()}"}
+            return (ref_node, "top", None), None
+        parent = ref_node.parentNode()
+        if parent is None or not (parent.parentNode() is None
+                                  or parent.type() == "grouplayer"):
+            return None, {"error": f"Cannot place a layer next to the mask "
+                                   f"'{ref_node.name()}'"}
+        return (parent, key, ref_node), None
+
+    def _default_placement(self, doc):
+        """Above the active layer (above a mask's layer), else top of root."""
+        node = doc.activeNode()
+        while node is not None and node.parentNode() is not None \
+                and node.type().endswith("mask"):
+            node = node.parentNode()
+        if node is None or node.parentNode() is None:
+            return doc.rootNode(), "top", None
+        return node.parentNode(), "above", node
+
+    def _insert(self, node, spec):
+        """Add an unattached node at spec = (parent, where, ref)."""
+        parent, where, ref = spec
+        siblings = [c for c in self._children(parent) if not self._same(c, node)]
+        if where == "above":
+            parent.addChildNode(node, ref)
+            return
+        if where == "below":
+            idx = next(i for i, c in enumerate(siblings) if self._same(c, ref))
+            if idx > 0:
+                parent.addChildNode(node, siblings[idx - 1])
+                return
+            where = "bottom"
+        if not siblings:
+            parent.addChildNode(node, None)  # libkis: None = top of parent
+            return
+        if where == "top":  # above the topmost layer (not above Krita's
+            parent.addChildNode(node, siblings[-1])  # global selection mask)
+            return
+        # bottom: libkis can only insert above a node, so go above the current
+        # bottom one and then lift that one above us.
+        low = siblings[0]
+        parent.addChildNode(node, low)
+        self._move(low, (parent, "above", node))
+
+    def _subtree(self, node):
+        return [(c, self._subtree(c)) for c in node.childNodes()]
+
+    def _restore(self, node, tree):
+        for child, sub in tree:  # bottom-to-top, each added on top
+            node.addChildNode(child, None)
+            self._restore(child, sub)
+
+    def _move(self, node, spec):
+        """Move an attached node. libkis has no move: Node.remove() runs
+        Krita's remove command, which detaches the children one by one, so
+        snapshot the subtree and put it back (same nodes, same ids)."""
+        tree = self._subtree(node)
+        node.remove()
+        self._insert(node, spec)
+        self._restore(node, tree)
+
+    def _check_target(self, node, spec):
+        """Refuse moving a node next to/into itself or its own descendants."""
+        parent, _, ref = spec
+        for probe in (parent, ref):
+            cur = probe
+            while cur is not None:
+                if self._same(cur, node):
+                    return {"error": f"Cannot place '{node.name()}' relative "
+                                     f"to itself or its own children"}
+                cur = cur.parentNode()
+        return None
+
+    def _apply_props(self, node, params, blend_id=None):
+        if blend_id:
+            node.setBlendingMode(blend_id)
+        if params.get("opacity") is not None:
+            pct = max(0.0, min(100.0, float(params["opacity"])))
+            node.setOpacity(int(round(pct * 255 / 100)))
+        if params.get("hidden"):
+            node.setVisible(False)
+
+    def _activate(self, doc, node):
+        doc.setActiveNode(node)
+        doc.waitForDone()
+
+    def _profile_for(self, model, depth):
+        names = list(Krita.instance().profiles(model, depth) or [])
+        prefer = {"RGBA": SRGB_PROFILE, "GRAYA": "Gray-D50-elle-V2-srgbtrc.icc"}
+        if prefer.get(model) in names:
+            return prefer[model]
+        srgb = [n for n in names if "srgb" in n.lower()]
+        return (srgb or names or [""])[0]
+
+    @staticmethod
+    def _is_rgba8(node):
+        return node.colorModel() == "RGBA" and node.colorDepth() == "U8"
+
+    def _gray_warning(self, node):
+        if node.colorModel().startswith("GRAY"):
+            return ("the layer is grayscale (the document is "
+                    f"{node.colorModel()}/{node.colorDepth()}): colours were "
+                    "converted to gray. Run `kri colorspace RGBA U8` first "
+                    "to keep them.")
+        return None
+
+    def _write_rgba8(self, doc, node, data, x, y, w, h, fresh=False):
+        """Write BGRA8 bytes (QImage ARGB32 layout) into node, whatever its
+        colour space. fresh=True: node is new/empty, convert it in place
+        (RGBA8 -> write -> back); otherwise go through a temporary RGBA8
+        layer so the node's other pixels keep their precision."""
+        if self._is_rgba8(node):
+            node.setPixelData(data, x, y, w, h)
+            return None
+        target = (node.colorModel(), node.colorDepth(), node.colorProfile())
+        if fresh:
+            if not node.setColorSpace("RGBA", "U8", self._profile_for("RGBA", "U8")):
+                return {"error": "Could not convert the layer to RGBA 8-bit"}
+            node.setPixelData(data, x, y, w, h)
+            node.setColorSpace(*target)
+            return None
+        tmp = doc.createNode("__kri_tmp", "paintlayer")
+        doc.rootNode().addChildNode(tmp, None)
+        try:
+            tmp.setColorSpace("RGBA", "U8", self._profile_for("RGBA", "U8"))
+            tmp.setPixelData(data, x, y, w, h)
+            tmp.setColorSpace(*target)
+            node.setPixelData(bytes(tmp.pixelData(x, y, w, h)), x, y, w, h)
+        finally:
+            tmp.remove()
+        return None
+
+    def _read_rgba8(self, doc, node, x, y, w, h, projection=True):
+        """Node pixels (projection by default) as BGRA8 bytes."""
+        raw = bytes(node.projectionPixelData(x, y, w, h) if projection
+                    else node.pixelData(x, y, w, h))
+        model, depth = node.colorModel(), node.colorDepth()
+        if model == "RGBA" and depth == "U8":
+            return raw
+        if model == "GRAYA" and depth == "U8":
+            gray, alpha = raw[0::2], raw[1::2]
+            out = bytearray(w * h * 4)
+            out[0::4] = gray
+            out[1::4] = gray
+            out[2::4] = gray
+            out[3::4] = alpha
+            return bytes(out)
+        tmp = doc.createNode("__kri_tmp", "paintlayer")
+        doc.rootNode().addChildNode(tmp, None)
+        try:
+            if (tmp.colorModel(), tmp.colorDepth()) != (model, depth):
+                tmp.setColorSpace(model, depth, node.colorProfile())
+            tmp.setPixelData(raw, x, y, w, h)
+            tmp.setColorSpace("RGBA", "U8", self._profile_for("RGBA", "U8"))
+            return bytes(tmp.pixelData(x, y, w, h))
+        finally:
+            tmp.remove()
+
+    def _selection_rect_and_mask(self, doc):
+        """(x, y, w, h), mask bytes of the global selection clipped to the
+        canvas — or an error dict."""
+        sel = doc.selection()
+        if sel is None:
+            return None, None, {"error": "No active selection"}
+        x0, y0 = max(0, sel.x()), max(0, sel.y())
+        x1 = min(doc.width(), sel.x() + sel.width())
+        y1 = min(doc.height(), sel.y() + sel.height())
+        if x1 <= x0 or y1 <= y0:
+            return None, None, {"error": "The selection is empty"}
+        rect = (x0, y0, x1 - x0, y1 - y0)
+        return rect, bytes(sel.pixelData(*rect)), None
+
+    def _paint_color(self, doc, node, qcolor, rect, mask=None, fresh=False):
+        """Fill rect of node with qcolor; with mask (selection bytes) only
+        where selected, weighted by its value. Alpha-locked layers keep
+        their alpha (SourceAtop), like painting with alpha lock in Krita."""
+        x, y, w, h = rect
+        alpha_locked = node.alphaLocked()
+        if mask is None and not alpha_locked:
+            img = QImage(w, h, QImage.Format.Format_ARGB32)
+            img.fill(qcolor)
+            return self._write_rgba8(doc, node, img.constBits().asstring(w * h * 4),
+                                     x, y, w, h, fresh=fresh)
+        if fresh:
+            base = QImage(w, h, QImage.Format.Format_ARGB32)
+            base.fill(0)
+        else:
+            raw = self._read_rgba8(doc, node, x, y, w, h, projection=False)
+            base = QImage(raw, w, h, w * 4, QImage.Format.Format_ARGB32).copy()
+        overlay = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
+        overlay.fill(qcolor)
+        if mask is not None:
+            alpha = QImage(mask, w, h, w, QImage.Format.Format_Alpha8)
+            p = QPainter(overlay)
+            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
+            p.drawImage(0, 0, alpha)
+            p.end()
+        p = QPainter(base)
+        p.setCompositionMode(
+            QPainter.CompositionMode.CompositionMode_SourceAtop if alpha_locked
+            else QPainter.CompositionMode.CompositionMode_SourceOver)
+        p.drawImage(0, 0, overlay)
+        p.end()
+        return self._write_rgba8(doc, node, base.constBits().asstring(w * h * 4),
+                                 x, y, w, h, fresh=fresh)
+
+    def _color_param(self, params, key="color"):
+        value = params.get(key)
+        if value is None:
+            return None, None
+        c = QColor(str(value))
+        if not c.isValid():
+            return None, {"error": f"Invalid colour '{value}' (use #RRGGBB)"}
+        c.setAlpha(255)
+        return c, None
+
+    def cmd_layer_list(self, params):
+        """The layer tree, top-to-bottom, with every property kri can set."""
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+        active = doc.activeNode()
+        active_id = self._node_id(active) if active is not None else ""
+
+        def tree(parent, prefix):
+            out = []
+            for child in reversed(self._children(parent)):
+                path = f"{prefix}/{child.name()}" if prefix else child.name()
+                info = self._layer_info(doc, child, path, active_id)
+                kids = tree(child, path)
+                if kids:
+                    info["children"] = kids
+                out.append(info)
+            return out
+
+        return {
+            "status": "ok",
+            "document": {"name": doc.name() or "(unsaved)",
+                         "width": doc.width(), "height": doc.height(),
+                         "color_model": doc.colorModel(),
+                         "color_depth": doc.colorDepth()},
+            "active": self._path(active) if active is not None else None,
+            "layers": tree(doc.rootNode(), ""),
+        }
+
+    def cmd_layer_blends(self, params):
+        """Valid blending-mode ids by category + accepted aliases."""
+        return {"status": "ok", "modes": BLEND_MODES, "aliases": BLEND_ALIASES}
+
+    def _add_new_node(self, doc, params, node, paint=None):
+        """Validate blend/placement, apply props, paint (optional callable
+        returning an error dict or None), insert and activate the new node.
+
+        On an RGBA8 node the pixels go in BEFORE inserting it: the add
+        command dirties the node itself, so no full refreshProjection is
+        needed (the fast path for importing a dozen full-size layers).
+        Other colour spaces convert the node, which needs it attached."""
+        blend_id = None
+        if params.get("blend"):
+            blend_id, err = self._blend_id(params["blend"])
+            if err:
+                return err
+        spec, err = self._placement(doc, params)
+        if err:
+            return err
+        self._apply_props(node, params, blend_id)
+        early = paint is not None and self._is_rgba8(node)
+        if early:
+            err = paint()
+            if err:
+                return err
+        self._insert(node, spec or self._default_placement(doc))
+        if paint is not None and not early:
+            err = paint()
+            if err:
+                node.remove()
+                return err
+        self._activate(doc, node)
+        if paint is not None and not early:
+            self._maybe_refresh(doc)
+        return None
+
+    def cmd_layer_new(self, params):
+        """New paint or group layer, placed and made active. `color` fills
+        it (inside the current selection only when `selection` is true)."""
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+        name = params.get("name")
+        if not name:
+            return {"error": "name required"}
+        ltype = params.get("type", "paint")
+        if ltype not in ("paint", "group"):
+            return {"error": f"Unknown layer type '{ltype}' (paint, group)"}
+        color, err = self._color_param(params)
+        if err:
+            return err
+        if color is not None and ltype == "group":
+            return {"error": "--color only applies to paint layers"}
+        rect = mask = None
+        if color is not None:
+            if params.get("selection"):
+                rect, mask, err = self._selection_rect_and_mask(doc)
+                if err:
+                    return err
+            else:
+                rect = (0, 0, doc.width(), doc.height())
+        node = doc.createNode(name, "paintlayer" if ltype == "paint" else "grouplayer")
+        paint = None
+        if color is not None:
+            def paint():
+                return self._paint_color(doc, node, color, rect, mask, fresh=True)
+        err = self._add_new_node(doc, params, node, paint)
+        if err:
+            return err
+        warning = self._gray_warning(node) if color is not None else None
+        out = {"status": "ok", "layer": self._layer_info(
+            doc, node, bounds=rect if color is not None else None)}
+        if warning:
+            out["warning"] = warning
+        return out
+
+    def cmd_layer_import(self, params):
+        """Load a PNG/JPG (alpha kept) into a new paint layer at x, y. The
+        file is read here, inside Krita, so no pixels travel over HTTP."""
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+        path = os.path.expanduser(str(params.get("path") or ""))
+        if not os.path.isabs(path):
+            return {"error": f"path must be absolute: '{path}'"}
+        if not os.path.isfile(path):
+            return {"error": f"File not found: {path}"}
+        img = QImage(path)
+        if img.isNull():
+            return {"error": f"Could not read image: {path}"}
+        img = img.convertToFormat(QImage.Format.Format_ARGB32)
+        w, h = img.width(), img.height()
+        if img.bytesPerLine() != w * 4:
+            return {"error": "Unexpected image stride"}
+        data = img.constBits().asstring(w * h * 4)
+        x, y = int(params.get("x", 0)), int(params.get("y", 0))
+        name = params.get("name") or os.path.splitext(os.path.basename(path))[0]
+        node = doc.createNode(name, "paintlayer")
+        err = self._add_new_node(
+            doc, params, node,
+            lambda: self._write_rgba8(doc, node, data, x, y, w, h, fresh=True))
+        if err:
+            return err
+        out = {"status": "ok",
+               "layer": self._layer_info(doc, node, bounds=False),
+               "image": {"width": w, "height": h, "x": x, "y": y}}
+        warning = self._gray_warning(node)
+        if warning:
+            out["warning"] = warning
+        return out
+
+    def cmd_layer_export(self, params):
+        """Write a layer's pixels (its projection: masks and children
+        included) to a PNG with alpha — canvas-sized, or cropped to the
+        layer bounds with `crop`. Selection masks export as grayscale."""
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+        node, err = self._resolve(doc, params.get("ref"))
+        if err:
+            return err
+        path = os.path.expanduser(str(params.get("path") or ""))
+        if not os.path.isabs(path):
+            return {"error": f"path must be absolute: '{path}'"}
+        if not os.path.isdir(os.path.dirname(path)):
+            return {"error": f"Directory does not exist: {os.path.dirname(path)}"}
+        if params.get("crop"):
+            r = self._bounds(node)
+            if r is None:
+                return {"error": f"Layer '{node.name()}' is empty"}
+            x, y, w, h = r
+        else:
+            x, y, w, h = 0, 0, doc.width(), doc.height()
+        if node.type() == "selectionmask":
+            data = bytes(node.selection().pixelData(x, y, w, h))
+            img = QImage(data, w, h, w, QImage.Format.Format_Grayscale8)
+        else:
+            data = self._read_rgba8(doc, node, x, y, w, h)
+            img = QImage(data, w, h, w * 4, QImage.Format.Format_ARGB32)
+        if not img.save(path, "PNG"):
+            return {"error": f"Could not write {path}"}
+        return {"status": "ok", "path": path, "layer": self._path(node),
+                "x": x, "y": y, "width": w, "height": h}
+
+    def cmd_layer_set(self, params):
+        """Change name / blend / opacity / visibility / locks of a layer."""
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+        node, err = self._resolve(doc, params.get("ref"))
+        if err:
+            return err
+        blend_id = None
+        if params.get("blend"):
+            blend_id, err = self._blend_id(params["blend"])
+            if err:
+                return err
+        if params.get("alpha_locked") is not None and node.type() != "paintlayer":
+            return {"error": "alpha lock only applies to paint layers"}
+        changed = []
+        if params.get("name"):
+            node.setName(str(params["name"]))
+            changed.append("name")
+        if blend_id:
+            node.setBlendingMode(blend_id)
+            changed.append("blend")
+        if params.get("opacity") is not None:
+            self._apply_props(node, {"opacity": params["opacity"]})
+            changed.append("opacity")
+        for key, setter in (("visible", node.setVisible),
+                            ("locked", node.setLocked),
+                            ("alpha_locked", node.setAlphaLocked),
+                            ("inherit_alpha", node.setInheritAlpha)):
+            if params.get(key) is not None:
+                setter(bool(params[key]))
+                changed.append(key)
+        if not changed:
+            return {"error": "Nothing to change"}
+        self._maybe_refresh(doc)
+        return {"status": "ok", "changed": changed,
+                "layer": self._layer_info(doc, node)}
+
+    def cmd_layer_move(self, params):
+        """Move a layer: above/below another, into a group, top or bottom."""
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+        node, err = self._resolve(doc, params.get("ref"))
+        if err:
+            return err
+        spec, err = self._placement(doc, params)
+        if err:
+            return err
+        if spec is None:
+            return {"error": "Where to? Use above, below, into, top or bottom"}
+        err = self._check_target(node, spec)
+        if err:
+            return err
+        prev = doc.activeNode()
+        self._move(node, spec)
+        if prev is not None:
+            self._activate(doc, prev)
+        self._maybe_refresh(doc)
+        return {"status": "ok", "layer": self._layer_info(doc, node)}
+
+    def cmd_layer_select(self, params):
+        """Make a layer the active one."""
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+        node, err = self._resolve(doc, params.get("ref"))
+        if err:
+            return err
+        self._activate(doc, node)
+        return {"status": "ok", "layer": self._layer_info(doc, node)}
+
+    def cmd_layer_duplicate(self, params):
+        """Copy a layer (above the original unless placed) and activate it."""
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+        node, err = self._resolve(doc, params.get("ref"))
+        if err:
+            return err
+        spec, err = self._placement(doc, params)
+        if err:
+            return err
+        if spec is None:
+            spec = (node.parentNode(), "above", node)
+        dup = node.duplicate()
+        dup.setName(params.get("name") or f"{node.name()} copy")
+        self._insert(dup, spec)
+        self._activate(doc, dup)
+        self._maybe_refresh(doc)
+        return {"status": "ok", "layer": self._layer_info(doc, dup)}
+
+    def cmd_layer_delete(self, params):
+        """Delete one or more layers (`refs` list, or a single `ref`)."""
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+        refs = params.get("refs") or ([params["ref"]] if params.get("ref") else [])
+        if not refs:
+            return {"error": "refs required"}
+        nodes = {}
+        for ref in refs:
+            node, err = self._resolve(doc, ref)
+            if err:
+                return err
+            nodes[self._node_id(node)] = node
+        removed = []
+        for node in nodes.values():
+            cur, inside = node.parentNode(), False
+            while cur is not None and not inside:  # goes with its group
+                inside = self._node_id(cur) in nodes
+                cur = cur.parentNode()
+            if inside:
+                continue
+            removed.append(self._path(node))
+            node.remove()
+        self._maybe_refresh(doc)
+        return {"status": "ok", "removed": removed}
+
+    def cmd_layer_group(self, params):
+        """Wrap layers in a new group placed where the topmost of them was,
+        keeping their stacking order."""
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+        name = params.get("name")
+        refs = params.get("refs") or []
+        if not name or not refs:
+            return {"error": "name and refs required"}
+        order = {self._node_id(n): i for i, (n, _, _) in
+                 enumerate(self._walk(doc.rootNode()))}
+        nodes = {}
+        for ref in refs:
+            node, err = self._resolve(doc, ref)
+            if err:
+                return err
+            if node.type().endswith("mask"):
+                return {"error": f"'{node.name()}' is a mask, not a layer"}
+            nodes[self._node_id(node)] = node
+        for node in nodes.values():
+            cur = node.parentNode()
+            while cur is not None:
+                if self._node_id(cur) in nodes:
+                    return {"error": f"'{node.name()}' is inside "
+                                     f"'{cur.name()}', group only one of them"}
+                cur = cur.parentNode()
+        ordered = sorted(nodes.values(), key=lambda n: order[self._node_id(n)])
+        group = doc.createNode(name, "grouplayer")
+        blend_id = None
+        if params.get("blend"):
+            blend_id, err = self._blend_id(params["blend"])
+            if err:
+                return err
+        self._apply_props(group, params, blend_id)
+        top = ordered[0]
+        top.parentNode().addChildNode(group, top)
+        for node in reversed(ordered):  # bottom-most first, each onto the top
+            self._move(node, (group, "top", None))
+        self._activate(doc, group)
+        self._maybe_refresh(doc)
+        return {"status": "ok", "layer": self._layer_info(doc, group),
+                "children": [self._path(n) for n in ordered]}
+
+    def cmd_layer_fill(self, params):
+        """Fill a paint layer with a colour: the whole canvas area, or only
+        inside the current selection (`selection`). Honors alpha lock."""
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+        node, err = self._resolve(doc, params.get("ref"))
+        if err:
+            return err
+        if node.type() != "paintlayer":
+            return {"error": f"Can only fill paint layers ('{node.name()}' "
+                             f"is {node.type()})"}
+        if node.locked():
+            return {"error": f"Layer '{node.name()}' is locked "
+                             f"(kri layer set REF --unlock)"}
+        color, err = self._color_param(params)
+        if err:
+            return err
+        if color is None:
+            return {"error": "color required"}
+        mask = None
+        if params.get("selection"):
+            rect, mask, err = self._selection_rect_and_mask(doc)
+            if err:
+                return err
+        else:
+            rect = (0, 0, doc.width(), doc.height())
+        err = self._paint_color(doc, node, color, rect, mask)
+        if err:
+            return err
+        self._maybe_refresh(doc)
+        out = {"status": "ok", "layer": self._layer_info(doc, node, bounds=False),
+               "filled": {"x": rect[0], "y": rect[1],
+                          "width": rect[2], "height": rect[3]}}
+        warning = self._gray_warning(node)
+        if warning:
+            out["warning"] = warning
+        return out
+
+    def cmd_doc_colorspace(self, params):
+        """Report the image colour space, or convert it (model/depth)."""
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+        before = {"color_model": doc.colorModel(), "color_depth": doc.colorDepth(),
+                  "profile": doc.colorProfile()}
+        model = params.get("model")
+        if not model:
+            return {"status": "ok", **before}
+        model = str(model).upper()
+        depth = str(params.get("depth") or "U8").upper()
+        profile = params.get("profile") or self._profile_for(model, depth)
+        if not profile or not doc.setColorSpace(model, depth, profile):
+            return {"error": (f"Could not convert to {model}/{depth} "
+                              f"(profile '{profile}'). Models: RGBA, GRAYA, "
+                              f"CMYKA, LABA, XYZA, YCbCrA; depths: U8, U16, "
+                              f"F16, F32")}
+        doc.waitForDone()
+        self._maybe_refresh(doc)
+        return {"status": "ok", "before": before,
+                "color_model": doc.colorModel(), "color_depth": doc.colorDepth(),
+                "profile": doc.colorProfile()}
+
+    # ----- Masks: selection <-> layers -----
+
+    def cmd_select_from_layer(self, params):
+        """Selection from a layer's alpha (Krita's native Select Opaque), so
+        the marching ants show; a selection mask restores its selection."""
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+        node, err = self._resolve(doc, params.get("ref"))
+        if err:
+            return err
+        mode = params.get("mode", "replace")
+        if node.type() == "selectionmask":
+            return self._load_selection_mask(doc, node, mode)
+        action_name = self.SELECT_OPAQUE_ACTIONS.get(mode)
+        if action_name is None:
+            return {"error": (f"Unknown mode '{mode}'. Valid: "
+                              f"{list(self.SELECT_OPAQUE_ACTIONS)}")}
+        if mode in ("subtract", "intersect") and doc.selection() is None:
+            return {"error": f"No existing selection to {mode} from"}
+        action = Krita.instance().action(action_name)
+        if action is None:
+            return {"error": f"Krita action not found: {action_name}"}
+        prev = doc.activeNode()
+        try:
+            self._activate(doc, node)
+            action.trigger()
+            doc.waitForDone()
+        finally:
+            if prev is not None:
+                doc.setActiveNode(prev)
+        self._maybe_refresh(doc)
+        return {"status": "ok", "layer": self._path(node), "mode": mode,
+                **self._selection_bounds(doc)}
+
+    def _load_selection_mask(self, doc, mask, mode):
+        sel = mask.selection()
+        w, h = doc.width(), doc.height()
+        data = bytes(sel.pixelData(0, 0, w, h))
+        img = QImage(data, w, h, w, QImage.Format.Format_Grayscale8).copy()
+        err = self._select_via_layer(doc, img, mode)
+        if err:
+            return err
+        return {"status": "ok", "mask": self._path(mask), "mode": mode,
+                **self._selection_bounds(doc)}
+
+    def cmd_select_save(self, params):
+        """Store the current selection as a named selection mask on a layer
+        (`on`, default the active layer). Same name on the same layer is
+        overwritten."""
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+        name = params.get("name")
+        if not name:
+            return {"error": "name required"}
+        sel = doc.selection()
+        if sel is None:
+            return {"error": "No active selection to save"}
+        if params.get("on"):
+            target, err = self._resolve(doc, params["on"])
+            if err:
+                return err
+        else:
+            target = doc.activeNode()
+            while target is not None and target.type().endswith("mask"):
+                target = target.parentNode()
+            if target is None or target.parentNode() is None:
+                return {"error": "No active layer to attach the mask to (use on)"}
+        if target.type().endswith("mask"):
+            return {"error": f"'{target.name()}' is a mask; save onto a layer"}
+        prev = doc.activeNode()
+        existing = [c for c in target.childNodes()
+                    if c.type() == "selectionmask" and c.name() == name]
+        if existing:
+            mask, replaced = existing[0], True
+        else:
+            mask, replaced = doc.createSelectionMask(name), False
+        mask.setSelection(sel.duplicate())
+        if not replaced:
+            target.addChildNode(mask, None)
+        if prev is not None:
+            self._activate(doc, prev)
+        self._maybe_refresh(doc)
+        return {"status": "ok", "replaced": replaced,
+                "mask": self._layer_info(doc, mask)}
+
+    def cmd_select_load(self, params):
+        """Restore a selection saved with select_save (a selection mask)."""
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+        node, err = self._resolve(doc, params.get("name"),
+                                  types=("selectionmask",), what="selection mask")
+        if err:
+            return err
+        return self._load_selection_mask(doc, node, params.get("mode", "replace"))
+
+    # ----- SAM daemon via the "AI Select (SAM)" plugin -----
+    # Same trick as AI Diffusion: both plugins live in Krita's one Python
+    # interpreter. We never import it ourselves (that would register a
+    # disabled plugin's docker); only use it if Krita already loaded it.
+
+    def _autoselect_manager(self):
+        mod = sys.modules.get("kritaautoselect")
+        # get_manager is the public name (krita-autoselect api_version 2);
+        # _get_manager is what older AI Select plugins expose.
+        getter = None
+        for attr in ("get_manager", "_get_manager"):
+            getter = getattr(mod, attr, None) if mod else None
+            if getter is not None:
+                break
+        if getter is None:
+            raise RuntimeError(
+                "AI Select (SAM) plugin not loaded — enable it in Settings > "
+                "Configure Krita > Python Plugin Manager")
+        return getter()
+
+    @staticmethod
+    def _url_key(url):
+        rest = str(url).split("://", 1)[-1].rstrip("/")
+        hostport = rest.split("/", 1)[0]
+        host, _, port = hostport.partition(":")
+        if host in ("localhost", "::1", "[::1]"):
+            host = "127.0.0.1"
+        return host, port or "80"
+
+    def cmd_sam_status(self, params):
+        """State of the SAM daemon AI Select manages (does not start it)."""
+        try:
+            mgr = self._autoselect_manager()
+        except RuntimeError as e:
+            return {"status": "ok", "ai_select": False, "detail": str(e)}
+        snap = mgr.snapshot()
+        out = {"status": "ok", "ai_select": True, "url": mgr.config.url,
+               "state": snap.get("state"), "detail": snap.get("detail") or "",
+               "owned": mgr.owned_alive, "loaded": snap.get("loaded"),
+               "pid": snap.get("pid"), "device": snap.get("device")}
+        if params.get("url"):
+            out["url_matches"] = (self._url_key(params["url"])
+                                  == self._url_key(mgr.config.url))
+        if self._sam_start is not None:
+            out["start"] = dict(self._sam_start)
+        return out
+
+    def cmd_sam_start(self, params):
+        """Ask AI Select to reuse or start its daemon. Returns at once; the
+        outcome lands in sam_status["start"] (kri polls it)."""
+        try:
+            mgr = self._autoselect_manager()
+        except RuntimeError as e:
+            return {"error": str(e), "ai_select": False}
+        url = params.get("url")
+        if url and self._url_key(url) != self._url_key(mgr.config.url):
+            return {"error": (f"AI Select manages the daemon at "
+                              f"{mgr.config.url}, but kri uses {url} "
+                              f"(AUTOSELECT_URL). Point AUTOSELECT_URL there "
+                              f"or change the URL in AI Select's settings."),
+                    "url": mgr.config.url}
+        self._sam_seq += 1
+        state = {"seq": self._sam_seq, "done": False}
+        self._sam_start = state
+
+        def done(ok, message):  # manager thread
+            state.update(done=True, ok=bool(ok), message=message or "")
+
+        mgr.start(done)
+        return {"status": "ok", "seq": state["seq"], "url": mgr.config.url,
+                "state": mgr.snapshot().get("state")}
+
+    def cmd_sam_stop(self, params):
+        """Stop the daemon AI Select started (a foreign one is never touched)."""
+        try:
+            mgr = self._autoselect_manager()
+        except RuntimeError as e:
+            return {"error": str(e), "ai_select": False}
+        stopped = mgr.stop()
+        return {"status": "ok", "stopped": stopped, "url": mgr.config.url,
+                "detail": "" if stopped else
+                "no daemon started by AI Select is running"}
 
     # ----- AI Diffusion bridge -----
     # Talks to the Acly/krita-ai-diffusion plugin running in the same Krita process.

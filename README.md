@@ -149,7 +149,13 @@ failing silently.
 
 ### 3. Install the `kri` CLI (on your machine)
 
-No dependencies, no venv — it's one stdlib-only Python file:
+All-in-one (shim, plugin, skills, hook, settings, ext-venv and MCP server;
+see [Instalación con `cli/install.py`](#instalación-con-cliinstallpy)):
+`python3 cli/install.py --plan-json` to preview, `python3 cli/install.py` to
+apply. By hand:
+
+No dependencies, no venv — stdlib-only Python (`cli/kri`, plus
+`cli/kri_extensions.py`, which only loads for extensions):
 
 ```bash
 ln -sf "$PWD/cli/kri" ~/.local/bin/kri     # make sure ~/.local/bin is on PATH
@@ -267,9 +273,52 @@ feather it, generate, apply, deselect.
 | `kri select info` | Bounds of the current selection (`null` if none) |
 | `kri select sam` | **AI selection** via the [krita-autoselect](https://github.com/chafamaster2000/krita-autoselect) SAM 3 daemon. With a text prompt (`kri select sam "the red car"`): every matching instance (union by default, `--instance N` picks one, `--list` only inspects). With only `--point X,Y` / `--box X Y W H`: the exact object under the click / in the box, SAM2-style. `--neg-point` excludes; same `--mode` combines |
 | `kri select from-mask FILE` | Selection from any grayscale mask image (white = selected), scaled to canvas if needed |
+| `kri select from-layer REF` | Selection from a layer's alpha (Krita's Select Opaque), same `--mode` |
+| `kri select save NAME [--on REF]` | Store the current selection as a named **selection mask** on a layer (default: the active one); same name on the same layer is overwritten |
+| `kri select load NAME` | Restore a saved selection mask as the selection, same `--mode` |
+
+`kri select sam … --to-layer NAME [--color HEX] [--blend MODE] [--opacity PCT] [placement] [--save-mask NAME]`
+also creates a paint layer filled with the colour (default white) inside the
+new selection — "select the beard and put it on its own layer" in one command.
+If the SAM daemon is down, `kri select sam` asks the **AI Select (SAM)** Krita
+plugin to start it and retries (see `kri sam` below).
 
 Note: selections clip AI generation and native Krita operations, but **not**
 `kri shape`/`stroke`/`fill`, which write pixel data directly.
+
+### Layers & masks
+
+A layer reference (`REF`) is a unique layer name, a `Group/Sub/Layer` path from
+the top level (a leading `/` pins a top-level layer) or the layer id that
+`kri layer list` prints. An ambiguous name fails and lists the candidates.
+Placement flags (one at a time): `--above REF`, `--below REF`, `--into GROUP`
+(top of the group), `--top`, `--bottom` (of the whole stack). Opacity is a
+percentage (0–100). Every command is also a `kri batch` action (in brackets).
+
+| Command | What it does |
+|------|--------------|
+| `kri layer list` [`layer_list`] | The tree, top to bottom: name, path, type, id, blend, opacity, visible, locked, alpha_locked, inherit_alpha, active, bounds — plus the document size and colour space |
+| `kri layer new NAME` [`layer_new`] | New paint layer (`--type group` for a group), placed (default: above the active layer) and made active. `--blend`, `--opacity`, `--hidden`, `--color HEX` fills it, `--selection` fills only inside the current selection |
+| `kri layer import FILE` [`layer_import`] | PNG/JPG (alpha kept) into a new paint layer. **Krita reads the file from disk**, no pixels over HTTP; ~0.5 s for a 2865×2604 PNG. `--name`, `--x/--y`, placement, `--blend`, `--opacity`, `--hidden`. On a non-RGBA8 document the pixels are converted to its colour space |
+| `kri layer export REF PATH` [`layer_export`] | The layer (with its masks/children) to a canvas-sized PNG with alpha; `--crop` to its bounds. Selection masks export as grayscale |
+| `kri layer set REF` [`layer_set`] | `--name`, `--blend`, `--opacity`, `--visible`/`--hidden`, `--lock`/`--unlock`, `--alpha-lock`/`--no-alpha-lock`, `--inherit-alpha`/`--no-inherit-alpha` (clip to the layers below) |
+| `kri layer move REF` [`layer_move`] | Move with the placement flags (children and masks travel along) |
+| `kri layer select REF` [`layer_select`] | Make it the active layer |
+| `kri layer duplicate REF` [`layer_duplicate`] | Copy (default name `<name> copy`, above the original unless placed) |
+| `kri layer delete REF...` [`layer_delete`] | Delete one or more layers |
+| `kri layer group NAME REF...` [`layer_group`] | Wrap layers in a new group where the topmost of them was, keeping their order |
+| `kri layer fill REF HEX` [`layer_fill`] | Fill a paint layer with a colour (whole canvas area), or only inside the selection with `--selection`. Honors alpha lock; refuses locked layers |
+| `kri layer blends` [`layer_blends`] | Valid blending-mode ids by category, plus the accepted aliases (`soft-light`→`soft_light`, `color-dodge`→`dodge`, `difference`→`diff`, …). Unknown modes fail with suggestions |
+| `kri colorspace [MODEL DEPTH]` [`doc_colorspace`] | Show the image colour space, or convert it (`kri colorspace RGBA U8`). A grayscale JPG opens as GRAYA: convert it before adding colour layers, or they come out gray |
+| `kri sam status` / `start` / `stop` [`sam_status`/`sam_start`/`sam_stop`] | The SAM daemon behind `kri select sam`, through the **AI Select (SAM)** Krita plugin: `start` asks it to reuse or launch its daemon and waits until it answers; `stop` stops only a daemon AI Select started. Without AI Select installed, start the daemon by hand |
+
+Notes: libkis has no "move", so moving is remove + re-add of the same node
+(id, children and masks are kept). Don't move a layer that is the *source of
+clone layers* this way: Krita turns the clones into paint layers when their
+source is removed. Pixel writes (`import`, `fill`, `new --color`) bypass
+Krita's undo history; layer structure changes are undoable. Grouping or moving
+many full-size layers costs ~0.5 s per layer (each step recomposites the
+image), so build the structure first and import `--into` the group.
 
 ### AI Diffusion bridge
 
@@ -358,6 +407,24 @@ reads from a layer you've drawn on:
 kri ai control add scribble --strength 0.7   # sources the active layer
 kri ai set-prompt -p "a knight in plate armor"
 kri ai generate --wait
+```
+
+### E — Comic flats from line art (SAM + layers)
+
+```bash
+kri open lineart.jpg && kri colorspace RGBA U8      # grayscale JPG → RGBA
+kri batch <<'EOF'                                    # structure in one round-trip
+[{"action": "layer_set", "params": {"ref": "Background", "name": "Line art", "blend": "multiply", "locked": true}},
+ {"action": "layer_new", "params": {"name": "Flats", "type": "group", "below": "Line art"}},
+ {"action": "layer_import", "params": {"path": "/abs/parts/coat.png", "name": "Coat", "into": "Flats"}},
+ {"action": "layer_import", "params": {"path": "/abs/parts/boots.png", "name": "Boots", "into": "Flats"}}]
+EOF
+kri select sam "the beard" --to-layer Beard --color "#eeeeee" --into Flats --save-mask "Beard mask"
+kri select none && kri look
+# later, for shading: a clipped multiply layer, filled inside the saved mask
+kri layer new "Beard shade" --above Beard --blend multiply --opacity 60 \
+  && kri layer set "Beard shade" --inherit-alpha \
+  && kri select load "Beard mask" && kri layer fill "Beard shade" "#8888aa" --selection
 ```
 
 ---
@@ -468,14 +535,219 @@ fills happen via one `QImage.fill()` instead of building a multi-hundred-megabyt
 Python byte list for a 4K canvas. The result is antialiased edges, reliable
 output, and no dependence on Krita's internal brush state.
 
+## Extensiones
+
+> Sección en castellano: es la parte nueva (rama `ext-system`).
+
+`kri` se puede extender sin tocar `cli/kri`. Una **extensión** es un paquete
+pip que agrega un subcomando: `kri <nombre> …`. kri no sabe nada de ninguna
+extensión en particular; las descubre al vuelo. La primera es **autopainter**
+(flats y sombreado automático de un lineart), pero el mecanismo es genérico y
+los tests usan una extensión de juguete.
+
+### Cómo encaja todo
+
+```
+Claude Code ──Bash──▶ kri ──HTTP :5678──▶ kritamcp (dentro de Krita)
+     │                 │  └─HTTP :5679──▶ daemon krita-autoselect (SAM 3)
+     │                 └─ kri autopainter … (extensión, en el ext-venv)
+     │                        usa ctx.send (Krita) y ctx.autoselect_require
+     │                        ("segment_many") (daemon) que le da kri
+     └──MCP stdio──▶ mcp/server.py ──subprocess──▶ kri … (natives + tools
+                                                    de las extensiones)
+```
+
+- **krita-autoselect** es el daemon SAM 3. kri lo usa directo
+  (`kri select sam`, `/segment`) y se lo presta a las extensiones con
+  `ctx.autoselect_require("segment_many")`, que exige `api_version` 2 o más.
+  Si el daemon es viejo, la extensión termina con un error que dice qué
+  actualizar; `kri sam status` lo muestra como `warning` y los comandos
+  nativos siguen andando.
+- **autopainter** se instala con `kri ext install -e ~/Odaclick/autopainter`
+  y queda como `kri autopainter …`. Su `kri-extension.toml` declara la tool
+  MCP `autopainter_run`, que el server MCP registra solo.
+
+### Dónde viven
+
+| Qué | Linux | macOS | Windows |
+|---|---|---|---|
+| ext-venv | `$XDG_DATA_HOME/kri/ext-venv` (`~/.local/share/…`) | `~/Library/Application Support/kri/ext-venv` | `%LOCALAPPDATA%\kri\ext-venv` |
+| habilitadas/deshabilitadas | `$XDG_CONFIG_HOME/kri/extensions.toml` | `~/Library/Application Support/kri/extensions.toml` | `%LOCALAPPDATA%\kri\extensions.toml` |
+
+El python del sistema suele ser *externally managed* (PEP 668), así que kri
+**no instala nada ahí** (nada de `--break-system-packages`): crea un venv propio
+con el mismo intérprete que lo corre y, sólo cuando el subcomando no es nativo,
+suma su `site-packages` al `sys.path` (con `site.addsitedir`, así andan los
+`pip install -e`). Si el python no trae `ensurepip` (Debian sin
+`python3-venv`), el venv se crea `--without-pip` y kri instala con `uv` o con
+el pip del sistema apuntado al venv (`pip --python`). `KRI_PIP=venv|uv|pip`
+fuerza uno.
+
+### Comandos
+
+Todos imprimen JSON (o texto con `--human`).
+
+| Comando | Qué hace |
+|---|---|
+| `kri ext list` | nombre, versión, `enabled`, `ok` y `reason` si no carga |
+| `kri ext install RUTA\|REQUISITO [-e] [--force]` | crea el ext-venv si falta, `pip install`, valida manifiesto, `min_kri`, python, choque con nativos, e importa y registra. Si algo falla **desinstala** (`rolled_back`) |
+| `kri ext enable\|disable NOMBRE` | la habilita o deshabilita (sigue instalada) |
+| `kri ext remove NOMBRE` (`--dist DIST`) | `pip uninstall` |
+| `kri ext mcp-tools` | tools MCP de las extensiones habilitadas, con `input_schema` y `argv_example` (lee manifiestos, no importa código) |
+| `kri ext doctor [NOMBRE]` | ext-venv, python y servicios declarados (`autoselect>=2`, `comfyui`, `claude-cli`, `krita`) |
+
+`kri --help` lista las extensiones instaladas. Si una extensión no carga,
+`kri <ext> …` devuelve `{"error": "extensión X rota: …", "hint": "kri ext list"}`
+(exit 1) y **los comandos nativos no se enteran**: nunca importan nada del
+ext-venv. Con `KRI_DEBUG=1` el error trae el traceback.
+
+### Escribir una extensión
+
+Tres piezas en el paquete:
+
+**1. Entry point** (en `pyproject.toml`; el nombre es el subcomando):
+
+```toml
+[project.entry-points."kri.extensions"]
+autopainter = "autopainter.kri_ext:register"
+```
+
+**2. `kri-extension.toml`** en la raíz del paquete, incluido como package
+data (`[tool.setuptools.package-data] autopainter = ["kri-extension.toml"]`):
+
+```toml
+[extension]
+name = "autopainter"            # = nombre del entry point
+version = "0.1.0"
+description = "Flats + sombreado automático por partes"
+min_kri = "0.5.0"
+entry_point = "autopainter.kri_ext:register"
+
+[dependencies]
+python = ">=3.11"
+services = ["autoselect>=2", "comfyui", "claude-cli"]   # lo mira `kri ext doctor`
+
+[[commands]]
+name = "run"
+help = "Pintar un lineart"
+
+[[mcp_tools]]
+name = "autopainter_run"
+command = ["run"]                       # → kri autopainter run …
+description = "Flats y sombreado de un lineart"
+params = { image = {type = "string", required = true}, mode = {type = "string", enum = ["sombras", "color"]}, krita = {type = "boolean"}, auto = {type = "boolean"} }
+positional = ["image"]
+timeout_s = 1800
+annotations = { openWorldHint = true }
+```
+
+Tipos de `params`: `string`, `integer`, `number`, `boolean`, `array`. Los
+admite con `enum`, `description`, `default`, `items`, `minimum` y `maximum`.
+Cómo se arma la línea de comando de una tool MCP: `kri EXT COMANDO…
+POSICIONALES --flag valor…`. El `_` del nombre pasa a `-`; un boolean en true
+queda como `--flag` solo (en false no va); un array queda como `--flag v1 v2`.
+Los posicionales no pueden empezar con `-`.
+
+**3. `register(ctx)`**. Las extensiones **no importan kri**: todo llega por
+`ctx`.
+
+```python
+def register(ctx):
+    sp = ctx.parser.add_subparsers(dest="cmd", metavar="command")
+    p = sp.add_parser("run", help="Pintar un lineart")
+    p.add_argument("image")
+    p.set_defaults(fn=run)
+
+def run(args, ctx):                       # handler(args, ctx)
+    url = ctx.autoselect_require("segment_many")   # o sale con el error
+    ctx.out({"status": "ok", "image": args.image})  # imprime y sale
+```
+
+| `ctx.` | |
+|---|---|
+| `version` | versión de kri (`kri --version`) |
+| `parser` | `ArgumentParser` de `kri <nombre>`; la extensión agrega sus subcomandos con `set_defaults(fn=handler)` |
+| `send(action, params=None, timeout=30.0)` | comando al plugin kritamcp (mismo socket crudo que kri) |
+| `http_request(method, path, body, timeout, url, hint)` | HTTP crudo a otro servicio local |
+| `krita_url`, `autoselect_url` | endpoints vigentes |
+| `sam_ensure(timeout=None)` | `(url, None)` o `(None, motivo)`: le pide a AI Select que arranque el daemon |
+| `autoselect_require(capability="segment_many")` | URL de un daemon con esa capacidad, o termina con un error que explica cómo actualizar |
+| `out(result)` | imprime JSON o `--human` y sale; si hay `error`, va a stderr con exit 1 |
+| `json` | `True` salvo `--human` |
+| `data_dir`, `config_dir` | `<data>/kri` y `<config>/kri` (usá un subdirectorio con tu nombre) |
+| `name`, `manifest` | el nombre y el manifiesto parseado |
+
+Si el handler devuelve un dict en vez de llamar a `ctx.out`, kri lo imprime.
+Una excepción en el handler sale como `{"error": "extensión X falló: …"}`.
+
+### Server MCP (`mcp/server.py`)
+
+El server MCP vuelve a estar versionado acá. Es el del tag `v-mcp-final` más
+los wrappers de capas, máscaras y SAM que llaman a `kri`. Al arrancar, corre
+`kri ext mcp-tools` y registra una tool por cada entrada. Cada tool ejecuta
+`kri <ext> <command…> …` con el `timeout_s` del manifiesto. El server no
+importa Python de las extensiones, así que su venv no necesita las
+dependencias de ellas. Si kri es viejo y no tiene `ext`, o hay un choque de
+nombres, no registra esas tools y lo anota en el log (stderr). Lee estas
+variables: `KRI_BIN` (el ejecutable de kri, por defecto `kri` del PATH),
+`KRITA_URL` y `KRITAMCP_TOKEN`. Después de instalar o sacar una extensión,
+hay que reiniciar el server (en Claude Code, reiniciar la sesión o
+`/mcp`).
+
+### Instalación con `cli/install.py`
+
+`cli/install.py` cumple el contrato de componente del instalador del
+ecosistema: `install_component(plan_only, uninstall, env) -> list[Action]`.
+Cada acción lleva `kind`, `src`, `dst`, `detail`, `status` (`create`,
+`update`, `ok`, `remove`, `absent` o `skip`) y `component`. Instala el shim,
+el plugin, `kritarc`, las skills, el hook, `settings.json`, el ext-venv y el
+server MCP. Es idempotente: la segunda corrida da todo en `ok`.
+
+**Respaldos.** Usa el mismo esquema que el instalador de autopainter, pero
+bajo `<data>/kri`. Si algo ya existe y no lo instaló kri (un shim viejo, las
+skills copiadas a mano, el plugin desplegado a mano), se **mueve** a
+`<data>/kri/backups/<fecha>/<ruta absoluta>` antes de reemplazarlo. El server
+MCP `krita` registrado antes (su `command`, `args` y `env`), el valor previo
+de `enable_kritamcp` en kritarc y el texto previo de `settings.json` quedan
+en `<data>/kri/install-manifest.json`. `--plan-json` muestra en `backup`
+adónde va cada cosa. `--uninstall` recorre el manifiesto al revés: saca lo
+nuestro, devuelve los respaldos (con `claude mcp add-json` en el caso del
+server MCP) y en `settings.json` saca sólo lo que agregó. En el plan, `restore`
+dice qué vuelve. Si no hay manifiesto, el uninstall no toca nada.
+`KRI_INSTALL_SKIP=mcp,settings` (o `--skip`) saltea componentes, y
+`env["platform"]` simula otra plataforma para los tests.
+
+```bash
+python3 cli/install.py --plan-json            # qué haría (JSON), sin tocar nada
+python3 cli/install.py                        # instalar
+python3 cli/install.py --uninstall            # desinstalar
+```
+
+El componente `mcp` corre `claude mcp add`. En un `HOME` temporal, el CLI
+`claude` deja sus propios archivos (`~/.claude.json`, `~/.claude/backups`) y
+el uninstall no los toca. Para probar el ciclo con el árbol vacío al final,
+usá `--skip mcp`.
+
+### Rendimiento
+
+El script `cli/kri` se recompila en cada invocación (un script no tiene
+`.pyc`): cada línea suma al arranque. Por eso la maquinaria de extensiones vive
+en `cli/kri_extensions.py`, que se importa sólo para `kri ext`, `kri --help` y
+los subcomandos no nativos, y usa el `.pyc` cacheado. Medición de `kri health`
+contra Krita, 200 corridas intercaladas: mediana de 67,4 ms antes y 68,4 ms
+después (**+1,0 ms**). Si todo quedaba en `cli/kri` eran +10,5 ms.
+
 ---
 
 ## Configuration
 
 | Setting | Default | How to change |
 |---------|---------|---------------|
-| Plugin HTTP port | `5678` | `SERVER_PORT` in the plugin `__init__.py` |
-| CLI endpoint | `http://localhost:5678` | `KRITA_URL` env var |
+| Plugin HTTP port | `5678` | `KRITAMCP_PORT` in Krita's environment (e.g. a second Krita for tests) |
+| CLI endpoint | `http://127.0.0.1:5678` | `KRITA_URL` env var |
+| Output format | JSON | `--human` (global flag, any position) |
+| Extension tracebacks | off | `KRI_DEBUG=1` |
+| SAM daemon for `kri select sam` | `http://127.0.0.1:5679`; when unset, whatever URL AI Select manages | `AUTOSELECT_URL` env var |
 | `kri look` output path | `/tmp/kri-canvas.jpg` | `KRI_LOOK_PATH` env var or `-o` |
 | Canvas/preview output dir | `~/krita-mcp-output` | `CANVAS_OUTPUT_DIR` in the plugin |
 | `kri exec` gate | disabled | `KRITAMCP_ALLOW_EXEC=1` in Krita's environment |
@@ -518,6 +790,9 @@ land at `/tmp/kri-canvas.jpg` (or `-o`).
   diffusion runs on AI Diffusion's asyncio loop and reports back via signals.
   There is no built-in "wait until done" in the plugin — `kri ai generate --wait`
   does the polling client-side so the assistant doesn't have to.
+- **Extensions are out of the hot path.** Native subcommands never import
+  `cli/kri_extensions.py`, `importlib.metadata` or the ext-venv; a test
+  (`test_native_commands_never_load_extensions`) guards it.
 - **Graceful degradation.** Model/architecture resolution is best-effort: if
   AI Diffusion's API has drifted, or you're offline, `kri ai status` still
   returns a usable payload with `model.available = false` rather than erroring.
