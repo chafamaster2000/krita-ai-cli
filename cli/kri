@@ -82,7 +82,13 @@ def http_request(method, path, body=None, timeout=30.0, url=None, hint=None):
     lines.append(f"Content-Length: {len(payload)}")
     raw = ("\r\n".join(lines) + "\r\n\r\n").encode() + payload
     try:
-        with socket.create_connection((host, port), timeout=timeout) as s:
+        s = socket.create_connection((host, port), timeout=timeout)
+    except (ConnectionError, socket.gaierror, socket.timeout, OSError) as e:
+        suffix = f" — {hint}" if hint else ""
+        return {"error": f"Cannot connect to {url}{suffix} ({e})",
+                "unreachable": True}
+    try:
+        with s:
             s.sendall(raw)
             chunks = []
             while True:
@@ -90,10 +96,17 @@ def http_request(method, path, body=None, timeout=30.0, url=None, hint=None):
                 if not chunk:
                     break
                 chunks.append(chunk)
-    except (ConnectionError, socket.gaierror, socket.timeout, OSError) as e:
-        suffix = f" — {hint}" if hint else ""
-        return {"error": f"Cannot connect to {url}{suffix} ({e})",
-                "unreachable": True}
+    except socket.timeout:
+        # Conectó pero no contestó: Krita está ocupado o colgado en el hilo
+        # principal (típico: un diálogo modal esperando un clic).
+        err = {"error": f"{url} accepted the connection but did not answer "
+                        f"within {timeout:.0f}s", "timeout": True}
+        if url == KRITA_URL:
+            err["hint"] = ("Krita may be blocked by a modal dialog: check "
+                           "with `kri dialog` (`kri dialog --dismiss` closes it)")
+        return err
+    except (ConnectionError, OSError) as e:
+        return {"error": f"Connection to {url} failed ({e})"}
     response = b"".join(chunks)
     head, _, resp_body = response.partition(b"\r\n\r\n")
     try:
@@ -285,6 +298,11 @@ def cmd_save(a):
 
 def cmd_open(a):
     out(send("open_file", {"path": os.path.abspath(a.path)}))
+
+
+def cmd_dialog(a):
+    """Modal dialog open in Krita (it blocks the plugin's commands)."""
+    out(send("modal_dialog", {"dismiss": bool(a.dismiss)}, timeout=10.0))
 
 
 def cmd_color_at(a):
@@ -875,6 +893,12 @@ def build_parser():
     sp = sub.add_parser("open", help="open a file in Krita")
     sp.add_argument("path")
     sp.set_defaults(fn=cmd_open)
+
+    sp = sub.add_parser("dialog",
+                        help="show the modal dialog blocking Krita, if any")
+    sp.add_argument("--dismiss", action="store_true",
+                    help="close it (reject: same as Esc)")
+    sp.set_defaults(fn=cmd_dialog)
 
     sp = sub.add_parser("color-at", help="eyedropper at X Y")
     sp.add_argument("x", type=int)

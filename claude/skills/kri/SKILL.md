@@ -82,6 +82,14 @@ turno cuando necesitás LEER el resultado para decidir el paso siguiente.
    Scripts CORTOS: corre en el main thread de Krita — bloquea la UI y un
    script colgado NO se puede abortar.
 
+**Diálogo modal.** Si un comando hace que Krita abra un diálogo modal (un
+aviso al abrir un archivo, por ejemplo), kri devuelve enseguida un error
+"Krita abrió un diálogo modal…" con el texto del diálogo, y los comandos
+siguientes fallan con "Krita está bloqueado por un diálogo modal" hasta que
+se cierre. `kri dialog` muestra qué diálogo es; `kri dialog --dismiss` lo
+cierra (equivale a Esc). Si es una pregunta con consecuencias (guardar,
+sobrescribir), mostrásela al usuario antes de cerrarla.
+
 ## Selecciones (inpaint dirigido)
 
 `kri select` maneja la selección del documento. AI Diffusion genera SOLO

@@ -38,6 +38,11 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 import os
 
+try:
+    from .modal import ModalGuard
+except ImportError:  # cargado como módulo suelto
+    from modal import ModalGuard
+
 # Configuration - customize these as needed
 # KRITAMCP_PORT: a second Krita (tests, another profile) can serve on its
 # own port; point kri at it with KRITA_URL.
@@ -181,6 +186,29 @@ class CommandQueue:
 # Global command queue
 command_queue = CommandQueue()
 command_counter = 0
+
+
+def describe_modal(w):
+    """Lo que se puede leer de un diálogo modal, para el error de kri."""
+    info = {"class": w.metaObject().className(), "title": w.windowTitle()}
+    if isinstance(w, QMessageBox):
+        info["text"] = w.text()
+        if w.informativeText():
+            info["informative"] = w.informativeText()
+        if w.detailedText():
+            info["detailed"] = w.detailedText()
+        info["buttons"] = [b.text().replace("&", "") for b in w.buttons()]
+    else:
+        try:
+            from PyQt6.QtWidgets import QLabel, QAbstractButton
+        except ImportError:
+            from PyQt5.QtWidgets import QLabel, QAbstractButton
+        info["text"] = "\n".join(l.text() for l in w.findChildren(QLabel)
+                                 if l.text())[:2000]
+        info["buttons"] = [b.text().replace("&", "")
+                           for b in w.findChildren(QAbstractButton)
+                           if b.isVisible() and b.text()][:12]
+    return info
 
 
 class CommandDispatcher(QObject):
@@ -369,6 +397,15 @@ class KritaMCPExtension(Extension):
             self.timer.timeout.connect(self.process_commands)
             self.timer.start(250)
 
+        # Vigía de diálogos modales, en un timer PROPIO: Qt no vuelve a
+        # disparar un timer mientras su slot sigue corriendo, y si el comando
+        # trabado lo arrancó el timer de respaldo, ese timer queda mudo
+        # durante todo el diálogo.
+        if getattr(self, "modal_timer", None) is None:
+            self.modal_timer = QTimer()
+            self.modal_timer.timeout.connect(self._watch_modal)
+            self.modal_timer.start(300)
+
     def _check_server_started(self):
         """Surface a startup bind failure with a visible warning (main thread)."""
         if self.server_thread is not None and self.server_thread.error is not None:
@@ -390,7 +427,13 @@ class KritaMCPExtension(Extension):
         — ejecutar OTRO comando en ese punto muta el documento en medio del
         primero y crashea libkis. Los comandos nuevos esperan al drain actual.
         """
+        guard = self._modal_guard()
         if getattr(self, "_processing_commands", False):
+            # Estamos dentro de un comando que procesa eventos. Si ese
+            # comando abrió un diálogo modal, se le contesta al cliente y a
+            # los que esperan detrás, en vez de dejarlos colgados.
+            if guard.check() is not None:
+                guard.answer_queued(self.execute_command)
             return
         self._processing_commands = True
         try:
@@ -399,10 +442,45 @@ class KritaMCPExtension(Extension):
                 if item is None:
                     return
                 command_id, command = item
-                result = self.execute_command(command)
+                guard.begin(command_id, (command or {}).get("action"))
+                try:
+                    result = self.execute_command(command)
+                finally:
+                    guard.end()
                 command_queue.set_result(command_id, result)
         finally:
             self._processing_commands = False
+
+    def _watch_modal(self):
+        if getattr(self, "_processing_commands", False):
+            guard = self._modal_guard()
+            if guard.check() is not None:
+                guard.answer_queued(self.execute_command)
+
+    def _modal_guard(self):
+        g = getattr(self, "_modal", None)
+        if g is None:
+            g = self._modal = ModalGuard(
+                command_queue, QApplication.activeModalWidget,
+                describe_modal)
+        return g
+
+    def cmd_modal_dialog(self, params):
+        """El diálogo modal abierto en Krita (o None). `dismiss`: cerrarlo
+        con reject(), lo mismo que Esc o la X. Se ejecuta aun con Krita
+        bloqueado por ese diálogo."""
+        m = QApplication.activeModalWidget()
+        if m is None:
+            return {"status": "ok", "modal": None, "dismissed": False}
+        info = describe_modal(m)
+        dismissed = False
+        if params.get("dismiss"):
+            if hasattr(m, "reject"):
+                m.reject()
+            else:
+                m.close()
+            dismissed = True
+        return {"status": "ok", "modal": info, "dismissed": dismissed}
 
     def _maybe_refresh(self, doc):
         """Refresh the projection unless we're inside a batch (which refreshes
@@ -924,8 +1002,16 @@ class KritaMCPExtension(Extension):
 
         app = Krita.instance()
 
-        # Open the document
-        doc = app.openDocument(filepath)
+        # Batchmode mientras se abre: si la carga trae avisos (un perfil de
+        # color que falta, capas que no se pudieron leer…), Krita los muestra
+        # en un QMessageBox modal que deja al comando colgado hasta que
+        # alguien lo cierre. En batchmode los anota en el log y sigue.
+        old_batch = app.batchmode()
+        app.setBatchmode(True)
+        try:
+            doc = app.openDocument(filepath)
+        finally:
+            app.setBatchmode(old_batch)
         if not doc:
             return {"error": f"Failed to open: {filepath}"}
 
