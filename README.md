@@ -175,6 +175,12 @@ ln -sf "$PWD/cli/kri" ~/.local/bin/kri     # make sure ~/.local/bin is on PATH
 kri health                                  # → {"status": "ok", "plugin": "kritamcp"}
 ```
 
+The symlink runs `kri` with whatever `python3` is first on the PATH. That is
+fine in a terminal, but apps launched from Finder or the desktop get a minimal
+PATH (on macOS, Apple's `python3`), and then `kri` doesn't see the extensions
+installed for another Python. `cli/install.py` writes a small sh launcher
+instead, with the interpreter's absolute path.
+
 Everyday flow with an assistant (or by hand):
 
 ```bash
@@ -724,6 +730,23 @@ Cada acción lleva `kind`, `src`, `dst`, `detail`, `status` (`create`,
 `update`, `ok`, `remove`, `absent` o `skip`) y `component`. Instala el shim,
 el plugin, `kritarc`, las skills, el hook, `settings.json`, el ext-venv y el
 server MCP. Es idempotente: la segunda corrida da todo en `ok`.
+
+**Intérprete fijo.** En Mac y Linux el shim `~/.local/bin/kri` es un lanzador
+`sh` que hace `exec <python> cli/kri "$@"` con el python que corrió el
+instalador (el mismo con el que crea el ext-venv), y el hook de
+`settings.json` usa ese mismo python con ruta absoluta. Así kri, el hook y el
+server MCP (que llama al lanzador vía `KRI_BIN`) no dependen del PATH: si
+Claude Code arranca desde Finder o el escritorio, `python3` puede ser otro (en
+macOS, el 3.9 de Apple) y kri no vería las extensiones. Si en
+`~/.local/bin/kri` hay un symlink de una versión anterior, el install lo
+reemplaza: si lo había puesto kri, sin respaldo; si estaba puesto a mano, lo
+respalda y el `--uninstall` lo devuelve. Un hook de kri con el `python3 …`
+de antes se actualiza al nuevo comando.
+
+**`CLAUDE_CONFIG_DIR`.** Si está seteada, skills, hook y `settings.json` van
+ahí en vez de a `~/.claude`, y el server MCP se lee de
+`$CLAUDE_CONFIG_DIR/.claude.json` (lo mismo que hace Claude Code y el
+instalador de autopainter).
 
 **Respaldos.** Usa el mismo esquema que el instalador de autopainter, pero
 bajo `<data>/kri`. Si algo ya existe y no lo instaló kri (un shim viejo, las

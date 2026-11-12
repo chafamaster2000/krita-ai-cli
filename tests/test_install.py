@@ -53,6 +53,18 @@ class PathsTest(unittest.TestCase):
                          r"C:\Users\u\AppData\Local\kri\ext-venv\Scripts\python.exe")
         self.assertEqual(p["skills"], r"C:\Users\u\.claude\skills")
 
+    def test_claude_config_dir(self):
+        for plat, home in (("linux", "/h"), ("darwin", "/Users/u")):
+            p = install.paths({"HOME": home, "CLAUDE_CONFIG_DIR": "/cc"}, plat)
+            self.assertEqual(p["claude"], "/cc")
+            self.assertEqual(p["skills"], "/cc/skills")
+            self.assertEqual(p["hooks"], "/cc/hooks")
+            self.assertEqual(p["settings"], "/cc/settings.json")
+            self.assertEqual(p["claude_json"], "/cc/.claude.json")
+        p = install.paths({"HOME": "/h", "CLAUDE_CONFIG_DIR": ""}, "linux")
+        self.assertEqual(p["claude"], "/h/.claude")
+        self.assertEqual(p["claude_json"], "/h/.claude.json")
+
     def test_windows_plan_uses_copies_and_cmd_shim(self):
         env = {"platform": "win32", "USERPROFILE": r"C:\Users\u",
                "APPDATA": r"C:\Users\u\AppData\Roaming",
@@ -96,6 +108,25 @@ class MergeTest(unittest.TestCase):
         self.assertEqual(install._settings_merge(merged, p, add=True), merged)
         self.assertEqual(install._settings_merge(merged, p, add=False), user)
 
+    def test_settings_hook_uses_absolute_python_and_migrates(self):
+        p = install.paths({"HOME": "/h"}, "linux")
+        py = "/opt/py 3/bin/python3"
+        old = install._settings_merge({}, p, add=True)  # el `python3 …` de antes
+        cmd = old["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        self.assertTrue(cmd.startswith("python3 "))
+        new = install._settings_merge(old, p, add=True, python=py)
+        hooks = new["hooks"]["PreToolUse"]
+        self.assertEqual(len(hooks), 1)
+        self.assertEqual(hooks[0]["hooks"][0]["command"],
+                         "'/opt/py 3/bin/python3' \"/h/.claude/hooks/"
+                         "krita-prompt-reminder.py\"")
+        self.assertEqual(install._settings_merge(new, p, add=True, python=py),
+                         new)
+        self.assertEqual(install._settings_merge(new, p, add=False), {})
+        # Windows no cambia: `python`
+        w = install.paths({"USERPROFILE": r"C:\Users\u"}, "win32")
+        self.assertTrue(install._hook_command(w, py).startswith("python "))
+
 
 class LiveCycleTest(unittest.TestCase):
     def test_install_reinstall_uninstall_in_temp_home(self):
@@ -106,7 +137,11 @@ class LiveCycleTest(unittest.TestCase):
         first = install.install_component(plan_only=False, env=env)
         self.assertFalse([a for a in first if a.get("error")], first)
         self.assertTrue(all(a["status"] == "create" for a in first))
-        self.assertTrue(os.path.islink(os.path.join(home, ".local", "bin", "kri")))
+        shim = os.path.join(home, ".local", "bin", "kri")
+        self.assertFalse(os.path.islink(shim))
+        self.assertTrue(os.access(shim, os.X_OK))
+        with open(shim) as f:
+            self.assertIn(sys.executable, f.read())
         self.assertTrue(os.path.isfile(os.path.join(
             home, ".local", "share", "krita", "pykrita", "kritamcp", "__init__.py")))
         self.assertTrue(os.path.exists(os.path.join(
@@ -134,6 +169,93 @@ class LiveCycleTest(unittest.TestCase):
         self.assertEqual(install.install_component(
             plan_only=False, uninstall=True, env=env), [])
         self.assertTrue(os.path.islink(os.path.join(bin_dir, "kri")))
+
+
+class LauncherMigrationTest(unittest.TestCase):
+    """~/.local/bin/kri pasa de symlink a lanzador sh con el python absoluto
+    (desde Finder el PATH es mínimo y `python3` es otro)."""
+
+    SKIP = "mcp,extvenv,plugin,kritarc,skills"
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp(prefix="kri-launcher-test-")
+        self.addCleanup(shutil.rmtree, self.home, True)
+        self.p = install.paths({"HOME": self.home}, "linux")
+        self.env = {"HOME": self.home, "platform": "linux",
+                    "PATH": os.environ.get("PATH", ""),
+                    "KRI_INSTALL_SKIP": self.SKIP}
+        self.src = os.path.join(REPO, "cli", "kri")
+
+    def test_launcher_runs_without_path(self):
+        done = install.install_component(plan_only=False, env=self.env)
+        self.assertFalse([a for a in done if a.get("error")], done)
+        import subprocess
+        r = subprocess.run([self.p["shim"], "--version"], capture_output=True,
+                           text=True, env={"PATH": "/nonexistent"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("kri", r.stdout + r.stderr)
+        with open(self.p["settings"]) as f:
+            hook = json.load(f)["hooks"]["PreToolUse"][0]["hooks"][0]
+        self.assertTrue(hook["command"].startswith(sys.executable + " ")
+                        or hook["command"].startswith("'" + sys.executable))
+
+    def test_hand_symlink_is_backed_up_and_restored(self):
+        """Lo de hoy en una máquina instalada a mano: symlink a cli/kri fuera
+        del manifiesto y un settings.json con el hook `python3 …`."""
+        os.makedirs(self.p["bin_dir"])
+        os.symlink(self.src, self.p["shim"])
+        os.makedirs(self.p["claude"])
+        old = install._settings_merge({"model": "x"}, self.p, add=True)
+        with open(self.p["settings"], "w") as f:
+            json.dump(old, f)
+        before = snapshot(self.home)
+
+        plan = install.install_component(plan_only=True, env=self.env)
+        shim = next(a for a in plan if a["component"] == "shim")
+        self.assertEqual((shim["kind"], shim["status"]), ("write", "update"))
+        self.assertTrue(shim["backup"])
+        self.assertIn("symlink", shim["detail"])
+
+        done = install.install_component(plan_only=False, env=self.env)
+        self.assertFalse([a for a in done if a.get("error")], done)
+        self.assertFalse(os.path.islink(self.p["shim"]))
+        self.assertTrue(os.path.islink(shim["backup"]))
+        with open(self.p["settings"]) as f:
+            cmd = json.load(f)["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        self.assertIn(sys.executable, cmd)
+        again = install.install_component(plan_only=False, env=self.env)
+        self.assertEqual({a["status"] for a in again}, {"ok"}, again)
+
+        gone = install.install_component(plan_only=False, uninstall=True,
+                                         env=self.env)
+        self.assertFalse([a for a in gone if a.get("error")], gone)
+        self.assertEqual(snapshot(self.home), before)
+
+    def test_symlink_from_manifest_is_replaced_without_backup(self):
+        """El symlink lo puso un install de kri anterior: se reemplaza, la
+        entrada vieja se va y el uninstall saca el lanzador."""
+        os.makedirs(self.p["bin_dir"])
+        os.symlink(self.src, self.p["shim"])
+        os.makedirs(os.path.dirname(self.p["manifest"]))
+        eid = "symlink|" + self.p["shim"]
+        with open(self.p["manifest"], "w") as f:
+            json.dump({"version": 1, "component": "kri", "entries": [
+                {"id": eid, "component": "shim", "kind": "symlink",
+                 "src": self.src, "dst": self.p["shim"]}]}, f)
+        env = dict(self.env, KRI_INSTALL_SKIP=self.SKIP + ",hook,settings")
+        plan = install.install_component(plan_only=True, env=env)
+        self.assertEqual([a["status"] for a in plan], ["update"])
+        self.assertNotIn("backup", plan[0])
+        done = install.install_component(plan_only=False, env=env)
+        self.assertFalse([a for a in done if a.get("error")], done)
+        with open(self.p["manifest"]) as f:
+            ids = [e["id"] for e in json.load(f)["entries"]]
+        self.assertEqual(ids, ["write|" + self.p["shim"]])
+        self.assertFalse(os.path.isdir(self.p["backups"]))
+        gone = install.install_component(plan_only=False, uninstall=True,
+                                         env=env)
+        self.assertFalse([a for a in gone if a.get("error")], gone)
+        self.assertEqual(os.listdir(self.home), [])
 
 
 FAKE_CLAUDE = """#!{python}
