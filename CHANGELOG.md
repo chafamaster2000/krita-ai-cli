@@ -5,6 +5,27 @@ tag anotado (`vX.Y.Z`) y coincide con `__version__` en `cli/kri`
 (`kri --version`). Las extensiones piden una versión mínima con `min_kri` en
 su `kri-extension.toml`.
 
+## [Unreleased]
+
+### Arreglado
+
+- **`kri` ya no depende del `python3` del PATH (Mac/Linux).** `cli/install.py`
+  escribe `~/.local/bin/kri` como lanzador `sh` que corre `cli/kri` con el
+  python del install (ruta absoluta), en vez de un symlink con
+  `#!/usr/bin/env python3`. Si Claude Code o el server MCP arrancaban desde
+  Finder o el escritorio, el PATH era mínimo, `python3` era otro (en macOS el
+  3.9 de Apple) y kri no veía las extensiones del ext-venv. El server MCP llega
+  al lanzador por `KRI_BIN`, y el hook de `settings.json` usa el mismo
+  intérprete absoluto (en Windows sigue `python`).
+- Migración: un symlink viejo en `~/.local/bin/kri` se reemplaza. Si lo había
+  puesto kri, sin respaldo; si estaba puesto a mano, se respalda y
+  `--uninstall` lo devuelve. Un hook de kri con el `python3 …` de antes pasa
+  al comando nuevo (y vuelve al de antes al desinstalar, si no lo había
+  agregado kri).
+- `cli/install.py` respeta `CLAUDE_CONFIG_DIR`: skills, hook, `settings.json`
+  y `.claude.json` van a esa carpeta si está seteada, igual que Claude Code y
+  el instalador de autopainter.
+
 ## [0.5.1] - 2026-11-11
 
 ### Arreglado

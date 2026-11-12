@@ -29,15 +29,20 @@ LOCALAPPDATA, XDG_*, PATH) más claves opcionales:
   KRI_INSTALL_SKIP  componentes a saltear, separados por coma (p. ej. "mcp,settings")
 
 Qué instala (contrato del instalador del ecosistema):
-  shim      kri en el PATH: symlink ~/.local/bin/kri (Unix) o
-            %LOCALAPPDATA%\\Programs\\kri\\kri.cmd (Windows)
+  shim      kri en el PATH: lanzador sh ~/.local/bin/kri (Unix) o
+            %LOCALAPPDATA%\\Programs\\kri\\kri.cmd (Windows), los dos con
+            el intérprete del install escrito con ruta absoluta (no
+            depende del PATH: desde Finder el python3 es otro y kri no
+            vería el ext-venv). Un symlink viejo a cli/kri se migra.
   plugin    krita-plugin/kritamcp + .desktop copiados a pykrita
   kritarc   [python] enable_kritamcp=true (con Krita cerrado: Krita reescribe
             kritarc al salir)
   skills    claude/skills/* a ~/.claude/skills (symlink; copia en Windows)
   hook      claude/hooks/krita-prompt-reminder.py a ~/.claude/hooks
   settings  ~/.claude/settings.json: allow Bash(kri:*), ask Bash(kri exec:*) y
-            el hook PreToolUse
+            el hook PreToolUse (en Unix, con el intérprete absoluto)
+  (~/.claude es $CLAUDE_CONFIG_DIR si está seteada; ~/.claude.json pasa a
+  $CLAUDE_CONFIG_DIR/.claude.json, como hace Claude Code)
   extvenv   <data>/kri/ext-venv (las extensiones: kri ext install)
   mcp       <data>/krita-mcp: venv + requirements + server.py, y
             `claude mcp add --scope user krita …`
@@ -49,6 +54,7 @@ import json
 import ntpath
 import os
 import posixpath
+import shlex
 import shutil
 import subprocess
 import sys
@@ -93,7 +99,8 @@ def paths(env, platform=None):
         pykrita = P.join(data, "krita", "pykrita")
         kritarc = P.join(conf, "kritarc")
         kri_data, kri_conf = P.join(data, "kri"), P.join(conf, "kri")
-    claude = P.join(home, ".claude")
+    claude_base = env.get("CLAUDE_CONFIG_DIR")
+    claude = claude_base or P.join(home, ".claude")
     mcp_dir = P.join(data, "krita-mcp")
     venv_bin = P.join("Scripts", "python.exe") if win else P.join("bin", "python")
     return {
@@ -112,7 +119,7 @@ def paths(env, platform=None):
         "mcp_venv": P.join(mcp_dir, ".venv"),
         "mcp_python": P.join(mcp_dir, ".venv", venv_bin),
         "mcp_server": P.join(mcp_dir, "server.py"),
-        "claude_json": P.join(home, ".claude.json"),
+        "claude_json": P.join(claude_base or home, ".claude.json"),
         "manifest": P.join(kri_data, "install-manifest.json"),
         "backups": P.join(kri_data, "backups"),
         "join": P.join,
@@ -310,6 +317,27 @@ def _copy(src, dst):
         shutil.copy2(src, dst)
 
 
+LAUNCHER_MARK = "# kri launcher (krita-ai-cli cli/install.py)"
+
+
+def _launcher_text(python, script):
+    """Lanzador sh de kri: el intérprete va con ruta absoluta para no
+    depender del PATH (Claude Code o el server MCP lanzados desde Finder o
+    el escritorio ven un PATH mínimo, y `python3` puede ser otro python cuyo
+    site-packages no es el del ext-venv)."""
+    return (f"#!/bin/sh\n{LAUNCHER_MARK}\n"
+            f"exec {shlex.quote(python)} {shlex.quote(script)} \"$@\"\n")
+
+
+def _venv_version(venv):
+    """'3.12' del pyvenv.cfg, o None."""
+    for line in (_read(os.path.join(venv, "pyvenv.cfg")) or "").splitlines():
+        k, _, v = line.partition("=")
+        if k.strip() in ("version_info", "version") and v.strip():
+            return ".".join(v.strip().split(".")[:2])
+    return None
+
+
 def _shim(ctx):
     p = ctx.p
     src = os.path.join(REPO, "cli", "kri")
@@ -318,7 +346,7 @@ def _shim(ctx):
     if not p["win"] and p["bin_dir"] not in path_dirs:
         detail += f" ({p['bin_dir']} no está en el PATH: agregalo)"
     if not p["win"]:
-        return [_link_or_copy(ctx, "shim", "symlink", src, p["shim"], detail)]
+        return [_launcher(ctx, src, detail)]
     content = f'@"{ctx.python}" "{src}" %*\r\n'
 
     def write():
@@ -327,6 +355,59 @@ def _shim(ctx):
     return [_placement(ctx, "shim", "write", src, p["shim"],
                        detail + f"; agregá {p['bin_dir']} al PATH",
                        _read(p["shim"]) == content, write)]
+
+
+def _launcher(ctx, src, detail):
+    """~/.local/bin/kri como script sh que corre cli/kri con ctx.python.
+
+    Migración desde el symlink de versiones anteriores: si el symlink lo
+    instaló kri (entrada `symlink|<shim>` en el manifiesto) se reemplaza sin
+    respaldo y la entrada nueva hereda su respaldo, si tenía; si no está en
+    el manifiesto (symlink puesto a mano) se respalda como cualquier cosa
+    ajena y el uninstall lo devuelve."""
+    shim = ctx.p["shim"]
+    content = _launcher_text(ctx.python, src)
+    eid = f"write|{shim}"
+    legacy = ctx.entry(f"symlink|{shim}")
+    exists = os.path.lexists(shim)
+    same = not os.path.islink(shim) and _read(shim) == content \
+        and os.access(shim, os.X_OK)
+    status = "ok" if same else ("update" if exists else "create")
+    detail += f"; lanzador con {ctx.python}"
+    have = _venv_version(ctx.p["ext_venv"])
+    if have and ctx.python == sys.executable and \
+            have != "%d.%d" % sys.version_info[:2]:
+        detail += (f" (ojo: el ext-venv es de python {have} y este de "
+                   f"{'%d.%d' % sys.version_info[:2]}; kri ext install se "
+                   f"va a quejar)")
+    extra = {}
+    move_to = None  # respaldo nuevo (lo que hay no es nuestro)
+    inherited = legacy.get("backup") if legacy is not None else None
+    if status == "update":
+        if os.path.islink(shim):
+            detail += "; reemplaza el symlink de versiones anteriores"
+        if legacy is None and ctx.entry(eid) is None:
+            move_to = extra["backup"] = ctx.backup_path(shim)
+            detail += f"; lo que hay se respalda en {move_to}"
+
+    def apply():
+        rec = {"component": "shim", "kind": "write", "src": src, "dst": shim}
+        if os.path.lexists(shim):
+            if move_to:
+                os.makedirs(os.path.dirname(move_to), exist_ok=True)
+                shutil.move(shim, move_to)
+            else:
+                _remove(shim)
+        os.makedirs(os.path.dirname(shim), exist_ok=True)
+        with open(shim, "w") as f:
+            f.write(content)
+        os.chmod(shim, 0o755)
+        if move_to or inherited:
+            rec["backup"] = move_to or inherited
+        if legacy is not None:
+            ctx.forget(legacy["id"])
+        return rec
+    return Act("shim", "write", src, shim, detail, status, apply, eid, **extra)
 
 
 def _plugin(ctx):
@@ -436,19 +517,24 @@ def _hook(ctx):
                           "hook de recordatorio de prompts")]
 
 
-def _hook_command(p):
-    py = "python" if p["win"] else "python3"
-    return f'{py} "{p["join"](p["hooks"], HOOK_FILE)}"'
+def _hook_command(p, python=None):
+    """Comando del hook. En Unix con el intérprete absoluto (desde Finder o
+    el escritorio el PATH es mínimo); en Windows, `python`."""
+    hook = p["join"](p["hooks"], HOOK_FILE)
+    if p["win"] or not python:
+        return f'{"python" if p["win"] else "python3"} "{hook}"'
+    return f'{shlex.quote(python)} "{hook}"'
 
 
 def _is_our_hook(h):
     return isinstance(h, dict) and HOOK_FILE in str(h.get("command", ""))
 
 
-def _settings_merge(data, p, add, items=None):
+def _settings_merge(data, p, add, items=None, python=None):
     """settings.json con (add) o sin (not add) los permisos y el hook de kri.
     Al sacar, `items` limita a lo que agregó el install ({"allow": [...],
-    "ask": [...], "hook": bool}); None = todo lo de kri."""
+    "ask": [...], "hook": bool}); None = todo lo de kri. Al agregar, un hook
+    nuestro con otro comando (el `python3 …` de antes) se actualiza."""
     data = json.loads(json.dumps(data))  # copia
     items = items or {"allow": ALLOW, "ask": ASK, "hook": True}
     perms = data.setdefault("permissions", {})
@@ -467,9 +553,13 @@ def _settings_merge(data, p, add, items=None):
     pre = hooks.setdefault("PreToolUse", [])
     has_ours = any(_is_our_hook(h) for e in pre if isinstance(e, dict)
                    for h in e.get("hooks", []))
+    command = _hook_command(p, python)
     if add and not has_ours:
         pre.append({"matcher": "Bash", "hooks": [
-            {"type": "command", "command": _hook_command(p), "timeout": 8}]})
+            {"type": "command", "command": command, "timeout": 8}]})
+    elif add:
+        for h in _our_hooks(data):
+            h["command"] = command
     elif not add and items.get("hook"):
         for entry in pre:
             if isinstance(entry, dict):
@@ -481,6 +571,13 @@ def _settings_merge(data, p, add, items=None):
     if not hooks:
         data.pop("hooks")
     return data
+
+
+def _our_hooks(data):
+    """Los hooks de kri en un settings.json (los dicts, para poder editarlos)."""
+    return [h for e in (data.get("hooks") or {}).get("PreToolUse") or []
+            if isinstance(e, dict) for h in e.get("hooks", [])
+            if _is_our_hook(h)]
 
 
 def _settings_added(before, p):
@@ -501,11 +598,14 @@ def _settings(ctx):
     except ValueError:
         return [Act("settings", "write", None, path,
                     "settings.json no es JSON válido: no lo toco", "skip")]
-    new = _settings_merge(data, ctx.p, add=True)
+    new = _settings_merge(data, ctx.p, add=True, python=ctx.python)
     status = "ok" if new == data and text is not None else (
         "update" if text is not None else "create")
     detail = (f"permisos allow {ALLOW}, ask {ASK} y hook PreToolUse "
               f"({HOOK_FILE}); el uninstall saca sólo lo que agregó")
+    want = _hook_command(ctx.p, ctx.python)
+    if any(h.get("command") != want for h in _our_hooks(data)):
+        detail += f"; el hook pasa a `{want}`"
 
     def apply():
         _write_text(path, json.dumps(new, indent=2) + "\n")
@@ -675,6 +775,17 @@ def _undo(ctx, e):
                 return
             new = _settings_merge(cur, p, add=False, items=e.get("added"))
             prev_text = e.get("prev_text")
+            # un hook de kri que ya estaba (no lo agregamos) vuelve a su
+            # comando de antes (el `python3 …` previo al lanzador)
+            try:
+                prev = json.loads(prev_text) if prev_text else {}
+            except ValueError:
+                prev = {}
+            old = [h.get("command") for h in _our_hooks(prev)] \
+                if isinstance(prev, dict) else []
+            if old:
+                for h in _our_hooks(new):
+                    h["command"] = old[0]
             if prev_text is not None and _same_json(prev_text, new):
                 _write_text(dst, prev_text)  # tal cual estaba, con su formato
             elif prev_text is None and not new:
